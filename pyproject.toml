@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-push"
+version = "0.1.0"
+description = "Hermes Agent plugin: trigger push notifications to the Hermes Mobile iOS app via the publisher's stateless push gateway."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Hermes Mobile" }]
+license = { text = "MIT" }
+dependencies = [
+    "fastapi",
+]
+
+[project.optional-dependencies]
+# Optional: enables the loopback /api/ws connector for complete/error/clarify
+# triggers. The plugin degrades gracefully (approval-via-hook still works) when
+# it is absent, so it is not a hard runtime dependency.
+ws = [
+    "websockets",
+]
+test = [
+    "pytest",
+    "httpx",
+    "websockets",
+]
+
+# Hermes discovers pip-installed plugins via this entry-point group. The host
+# calls ``ep.load()`` which resolves the ``module:attr`` reference below, then
+# calls ``register(ctx)`` on it. See hermes_cli/plugins.py (_scan_entry_points,
+# _load_entrypoint_module).
+[project.entry-points."hermes_agent.plugins"]
+hermes-push = "hermes_push:register"
+
+[tool.setuptools]
+packages = ["hermes_push"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

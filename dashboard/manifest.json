@@ -1,0 +1,11 @@
+{
+  "name": "hermes-push",
+  "label": "Push Notifications",
+  "description": "Register the Hermes Mobile iOS app for push notifications and forward triggers to the push gateway.",
+  "icon": "Bell",
+  "version": "0.1.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}
