@@ -56,7 +56,7 @@ from hermes_push import api
 from hermes_push.policy import SuppressionPolicy
 from hermes_push.sender import GatewaySender
 from hermes_push.store import TokenStore
-from hermes_push.triggers import TriggerDispatcher
+from hermes_push.triggers import TYPE_CLARIFY, TYPE_COMPLETE, TriggerDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +152,32 @@ def _on_session_end(**kwargs: Any) -> None:
 
 
 def _pipeline(payload: Dict[str, str]) -> None:
-    """The dispatcher sink: policy.decide → (if send) sender.send. Never raises."""
+    """The dispatcher sink: policy.decide → (if send) sender.send. Never raises.
+
+    Per-turn clarify suppression: a turn that already fired a ``clarify`` push
+    has just pinged the user to come answer, so the trailing ``complete`` push is
+    redundant. We skip ``complete`` outright (never even run it through the
+    policy) when the session is marked, and mark the session whenever a
+    ``clarify`` is decided to be sent.
+    """
     if _policy is None or _sender is None:
         return
+
+    payload_type = str(payload.get("type") or "")
+    session_id = str(payload.get("session_id") or "")
+
+    # complete: short-circuit if a clarify already notified this turn.
+    if payload_type == TYPE_COMPLETE and session_id:
+        try:
+            if _policy.clarify_notified(session_id):
+                logger.debug(
+                    "hermes-push: suppressed complete (clarify already notified)"
+                )
+                _policy.clear_clarify_notified(session_id)
+                return
+        except Exception as exc:  # pragma: no cover — never break a turn
+            logger.warning("hermes-push: clarify_notified check failed: %s", exc)
+
     try:
         decision = _policy.decide(payload)
     except Exception as exc:  # pragma: no cover — policy must never break a turn
@@ -163,6 +186,16 @@ def _pipeline(payload: Dict[str, str]) -> None:
     if not decision.send:
         logger.debug("hermes-push: suppressed push (%s)", decision.reason)
         return
+
+    # clarify: record that this turn pinged the user so the trailing complete is
+    # suppressed. Mark only when actually decided-to-send (a suppressed clarify
+    # must not suppress the complete).
+    if payload_type == TYPE_CLARIFY and session_id:
+        try:
+            _policy.mark_clarify_notified(session_id)
+        except Exception as exc:  # pragma: no cover — never break a turn
+            logger.warning("hermes-push: mark_clarify_notified failed: %s", exc)
+
     _sender.send(payload)
 
 

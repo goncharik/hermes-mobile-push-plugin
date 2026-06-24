@@ -304,3 +304,109 @@ def test_on_session_end_clears_turn_start(monkeypatch, tmp_path):
     assert "sd" in policy._turn_starts
     hermes_push._on_session_end(session_id="sd", completed=True, interrupted=False)
     assert "sd" not in policy._turn_starts
+
+
+# ---------------------------------------------------------------------------
+# Per-turn clarify suppression of the trailing complete push
+# (clarify push fired this turn → the >10s complete is redundant and skipped)
+# ---------------------------------------------------------------------------
+
+
+def _wire_clarify_suppression(monkeypatch, tmp_path):
+    """A real pipeline + a controllable clock, bound to the dispatcher."""
+    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
+    store = TokenStore(base_dir=tmp_path)
+    store.upsert(device_token="dt", apns_env="production", app_version="1")
+
+    fake_now = {"t": 0.0}
+    policy = SuppressionPolicy(
+        client_present=lambda _sid: False,
+        device_count=lambda: len(store.list_all()),
+        clock=lambda: fake_now["t"],
+    )
+    sender = _CountingSink()
+    monkeypatch.setattr(hermes_push, "_store", store)
+    monkeypatch.setattr(hermes_push, "_policy", policy)
+    monkeypatch.setattr(hermes_push, "_sender", sender)
+
+    dispatcher = TriggerDispatcher()
+    dispatcher.set_sink(hermes_push._pipeline)
+    return dispatcher, sender, policy, fake_now
+
+
+def _types(sink):
+    return [p["type"] for p in sink.sent]
+
+
+def test_clarify_suppresses_trailing_complete(monkeypatch, tmp_path):
+    """clarify this turn, then a >10s completion → clarify sent, NO complete."""
+    dispatcher, sink, _policy, now = _wire_clarify_suppression(monkeypatch, tmp_path)
+
+    # Turn start at t=0.
+    hermes_push._on_pre_llm_call(session_id="sc")
+    # Clarify fires (pre_tool_call) — sent, and marks the session.
+    dispatcher.on_pre_tool_call(tool_name="clarify", args={"q": "x"}, session_id="sc")
+    # Turn finishes after >10s — complete would normally pass the duration gate.
+    now["t"] = 15.0
+    dispatcher.on_post_llm_call(session_id="sc")
+
+    assert _types(sink) == ["clarify"], "complete must be suppressed after a clarify"
+
+
+def test_complete_fires_without_clarify(monkeypatch, tmp_path):
+    """No clarify, >10s → complete fires as before."""
+    dispatcher, sink, _policy, now = _wire_clarify_suppression(monkeypatch, tmp_path)
+
+    hermes_push._on_pre_llm_call(session_id="sc")
+    now["t"] = 15.0
+    dispatcher.on_post_llm_call(session_id="sc")
+
+    assert _types(sink) == ["complete"]
+
+
+def test_clarify_flag_resets_per_turn(monkeypatch, tmp_path):
+    """A clarify in turn 1 must not suppress complete in turn 2."""
+    dispatcher, sink, _policy, now = _wire_clarify_suppression(monkeypatch, tmp_path)
+
+    # Turn 1: clarify → complete suppressed.
+    hermes_push._on_pre_llm_call(session_id="sc")
+    dispatcher.on_pre_tool_call(tool_name="clarify", args={"q": "x"}, session_id="sc")
+    now["t"] = 15.0
+    dispatcher.on_post_llm_call(session_id="sc")
+    assert _types(sink) == ["clarify"]
+
+    # Turn 2: pre_llm_call resets the flag; no clarify; >10s → complete fires.
+    now["t"] = 20.0
+    hermes_push._on_pre_llm_call(session_id="sc")
+    now["t"] = 35.0
+    dispatcher.on_post_llm_call(session_id="sc")
+    assert _types(sink) == ["clarify", "complete"]
+
+
+def test_suppressed_clarify_does_not_suppress_complete(monkeypatch, tmp_path):
+    """A clarify dropped by the policy (no devices) must NOT suppress complete."""
+    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
+    store = TokenStore(base_dir=tmp_path)  # no devices registered
+    fake_now = {"t": 0.0}
+    policy = SuppressionPolicy(
+        client_present=lambda _sid: False,
+        device_count=lambda: len(store.list_all()),  # 0 → clarify suppressed
+        clock=lambda: fake_now["t"],
+    )
+    sink = _CountingSink()
+    monkeypatch.setattr(hermes_push, "_store", store)
+    monkeypatch.setattr(hermes_push, "_policy", policy)
+    monkeypatch.setattr(hermes_push, "_sender", sink)
+    dispatcher = TriggerDispatcher()
+    dispatcher.set_sink(hermes_push._pipeline)
+
+    hermes_push._on_pre_llm_call(session_id="sc")
+    # Clarify decided NOT to send (no devices) → must not mark the session.
+    dispatcher.on_pre_tool_call(tool_name="clarify", args={"q": "x"}, session_id="sc")
+    assert policy.clarify_notified("sc") is False
+
+    # Register a device, then a >10s complete still fires (clarify never went out).
+    store.upsert(device_token="dt", apns_env="production", app_version="1")
+    fake_now["t"] = 15.0
+    dispatcher.on_post_llm_call(session_id="sc")
+    assert _types(sink) == ["complete"]

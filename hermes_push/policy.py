@@ -132,6 +132,11 @@ class SuppressionPolicy:
         self._turn_starts: Dict[str, float] = {}
         # (session_id, type) -> monotonic instant of the last *sent* push.
         self._last_sent: Dict[Tuple[str, str], float] = {}
+        # session_ids that fired a clarify push in the CURRENT turn. While set,
+        # the trailing turn-``complete`` push is redundant (the user was just
+        # pinged to come answer) and is suppressed outright. Reset per turn at
+        # ``note_turn_start`` and cleared again at ``clear_turn_start``.
+        self._clarify_notified: set[str] = set()
 
     # -- turn-start bookkeeping (feeds the duration gate) -----------------
 
@@ -139,18 +144,49 @@ class SuppressionPolicy:
         """Record that a turn started for ``session_id`` (now, per the clock).
 
         Called by the caller on the turn-start / ``message.start`` signal. The
-        duration gate reads this at complete/error to compute elapsed.
+        duration gate reads this at complete/error to compute elapsed. We also
+        RESET the per-turn clarify-notified flag here so a clarify from a prior
+        turn never suppresses this turn's ``complete``.
         """
         with self._lock:
             self._turn_starts[str(session_id)] = self._clock()
+            self._clarify_notified.discard(str(session_id))
 
     def clear_turn_start(self, session_id: str) -> None:
         """Forget a session's turn start (call on completion / interrupt).
 
-        Idempotent — clearing an unknown session is a no-op.
+        Idempotent — clearing an unknown session is a no-op. Also clears the
+        per-turn clarify-notified flag (cleanup, mirrors ``note_turn_start``).
         """
         with self._lock:
             self._turn_starts.pop(str(session_id), None)
+            self._clarify_notified.discard(str(session_id))
+
+    # -- per-turn clarify-notified flag (suppresses a redundant complete) -
+
+    def mark_clarify_notified(self, session_id: str) -> None:
+        """Mark that a clarify push fired for ``session_id`` this turn.
+
+        Called by the pipeline when a clarify payload is decided to be SENT, so
+        a clarify that the policy suppressed (no-devices / dedup / etc.) does not
+        suppress the turn's ``complete``.
+        """
+        with self._lock:
+            self._clarify_notified.add(str(session_id))
+
+    def clarify_notified(self, session_id: str) -> bool:
+        """True if a clarify push already fired for ``session_id`` this turn."""
+        with self._lock:
+            return str(session_id) in self._clarify_notified
+
+    def clear_clarify_notified(self, session_id: str) -> None:
+        """Clear the per-turn clarify-notified flag for ``session_id``.
+
+        Called after a ``complete`` is suppressed so a second (unlikely) complete
+        in the same turn is not also swallowed by a stale flag.
+        """
+        with self._lock:
+            self._clarify_notified.discard(str(session_id))
 
     # -- the decision ----------------------------------------------------
 
