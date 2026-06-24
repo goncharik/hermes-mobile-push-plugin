@@ -33,10 +33,13 @@ How the events surface (verified against hermes-agent — see STEP 0 findings)
   genuine failure (``completed is False AND interrupted is False``); success is
   already covered by ``post_llm_call`` and interrupts are user-initiated.
 
-* **clarify** — NOT currently supported. The agent's clarify/input-needed event
-  is emitted straight to the per-session WebSocket transport and has no
-  registerable plugin hook, so the plugin cannot observe it. The ``clarify``
-  payload type is kept here for forward-compatibility but nothing maps to it.
+* **clarify** — the ``pre_tool_call`` hook (``model_tools.py`` /
+  ``agent/tool_executor.py``), an *observer* hook fired for EVERY tool call in
+  BOTH CLI and gateway with ``tool_name`` / ``args`` / ``session_id``. We filter
+  to ``tool_name == "clarify"`` (the clarify tool fires this BEFORE the user is
+  prompted) and push a generic ``clarify``. We read ONLY ``session_id`` — never
+  the clarify ``question`` / ``choices`` / args. The hook may return a block
+  directive, but we are an observer and always return ``None``.
 
 This module keeps the *pure* mapping (hook kwargs → payload) separate from any
 I/O so the suite can assert payloads without a running agent.
@@ -64,8 +67,8 @@ def _noop_sink(_payload: Dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 # The payload ``type`` values, matching the gateway-fn / iOS contract.
-# ``clarify`` is kept for forward-compatibility but is NOT currently produced —
-# the agent's clarify event has no registerable plugin hook (see module docstring).
+# ``clarify`` is produced from the ``pre_tool_call`` hook filtered to the clarify
+# tool (see module docstring / :func:`map_clarify`).
 TYPE_APPROVAL = "approval"
 TYPE_CLARIFY = "clarify"
 TYPE_COMPLETE = "complete"
@@ -91,6 +94,10 @@ BODIES: Dict[str, str] = {
 # The approval surfaces we push for. CLI-interactive approvals are answered at
 # the terminal, so they never need a phone notification.
 _REMOTE_APPROVAL_SURFACES = frozenset({"gateway"})
+
+# The tool whose ``pre_tool_call`` we treat as a clarify / input-needed event.
+# ``pre_tool_call`` fires for EVERY tool, so we filter cheaply on this name first.
+_CLARIFY_TOOL_NAME = "clarify"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +188,26 @@ def map_complete(**kwargs: Any) -> Optional[Dict[str, str]]:
     return make_payload(TYPE_COMPLETE, session_id)
 
 
+def map_clarify(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Map a ``pre_tool_call`` hook invocation → a generic ``clarify`` payload.
+
+    ``pre_tool_call`` fires for EVERY tool call (CLI + gateway), so we filter
+    cheaply on ``tool_name == "clarify"`` first and skip everything else. The
+    clarify tool fires this hook BEFORE the user is prompted — exactly the
+    "input needed" moment we want to surface.
+
+    Reads ONLY ``session_id`` — NEVER the clarify ``question`` / ``choices`` /
+    ``args`` (privacy rule). Returns ``None`` for any non-clarify tool or when no
+    session id is available.
+    """
+    if str(kwargs.get("tool_name") or "") != _CLARIFY_TOOL_NAME:
+        return None
+    session_id = _hook_session_id(kwargs)
+    if not session_id:
+        return None
+    return make_payload(TYPE_CLARIFY, session_id)
+
+
 def map_session_end(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Map an ``on_session_end`` hook invocation → an ``error`` payload, or skip.
 
@@ -243,6 +270,19 @@ class TriggerDispatcher:
         host's approval flow.
         """
         self._emit_payload(map_approval(**kwargs))
+        return None
+
+    # -- clarify (pre_tool_call) hook ------------------------------------
+
+    def on_pre_tool_call(self, **kwargs: Any) -> None:
+        """``pre_tool_call`` hook callback (observer; returns None).
+
+        Filters to the clarify tool and maps it to a generic ``clarify``
+        payload, feeding the sink. Every other tool is ignored. Reads only
+        ``session_id`` — never the clarify args. Always returns ``None`` so it
+        can never block the tool (we are an observer, not a gatekeeper).
+        """
+        self._emit_payload(map_clarify(**kwargs))
         return None
 
     # -- turn-complete hook ----------------------------------------------

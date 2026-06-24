@@ -153,6 +153,43 @@ def test_complete_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
     assert "SECRET CONTENT" not in json.dumps(req)
 
 
+def test_clarify_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
+    """pre_tool_call(clarify) → clarify reaches the gateway, leaking no args.
+
+    Even a near-instant turn must notify (clarify is NOT duration-gated).
+    """
+    http = _RecordingHttp()
+    dispatcher, sender = _wire_real_pipeline(monkeypatch, tmp_path, http=http)
+
+    # The clarify tool's args carry the question/choices — none may leak.
+    dispatcher.on_pre_tool_call(
+        tool_name="clarify",
+        args={"question": "SECRET CONTENT", "choices": ["SECRET CONTENT"]},
+        session_id="sx",
+    )
+    from hermes_push.triggers import map_clarify
+
+    payload = map_clarify(tool_name="clarify", session_id="sx")
+    sender.send_blocking(payload)
+
+    assert http.bodies, "clarify did not reach the gateway"
+    req = http.bodies[-1]
+    assert req["type"] == "clarify"
+    assert req["session_id"] == "sx"
+    assert "SECRET CONTENT" not in json.dumps(req)
+
+
+def test_clarify_non_clarify_tool_does_not_deliver(monkeypatch, tmp_path):
+    """A non-clarify tool call must produce no gateway request."""
+    http = _RecordingHttp()
+    dispatcher, _sender = _wire_real_pipeline(monkeypatch, tmp_path, http=http)
+
+    assert dispatcher.on_pre_tool_call(
+        tool_name="shell", args={"command": "x"}, session_id="sx"
+    ) is None
+    assert http.bodies == []
+
+
 def test_error_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
     """on_session_end failure → error reaches the gateway."""
     http = _RecordingHttp()
@@ -209,6 +246,7 @@ def test_register_survives_pipeline_failure(monkeypatch):
     hermes_push.register(ctx)
     assert set(ctx.hooks) == {
         "pre_approval_request",
+        "pre_tool_call",
         "pre_llm_call",
         "post_llm_call",
         "on_session_end",

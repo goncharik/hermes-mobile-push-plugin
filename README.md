@@ -15,20 +15,18 @@ so they fire in both CLI and gateway sessions:
 | `approval` | `pre_approval_request` | A dangerous tool needs approval (gateway surface only; CLI prompts are skipped). |
 | `complete` | `post_llm_call`        | A user turn finished successfully (after the tool-loop, once a final assistant response exists). Gated to turns longer than ~10s + deduped. |
 | `error`    | `on_session_end`       | A turn ended in a genuine failure (`completed is False and interrupted is False`). User interrupts and successes never push. |
+| `clarify`  | `pre_tool_call`        | The model calls the `clarify` tool (input needed), **before** the user is prompted. `pre_tool_call` fires for every tool, so we filter to `tool_name == "clarify"`; like approval it is an attention-needed pause and is **not** duration-gated. We are an observer and never block the tool. |
 
 The turn-complete **duration gate** is anchored by the `pre_llm_call` hook
 (turn start) and cleared at `on_session_end`. `pre_llm_call`, `post_llm_call` and
 `on_session_end` all carry `session_id == agent.session_id`, so they line up with
-each other and with the approval hook's `session_key`.
+each other and with the approval hook's `session_key` and `pre_tool_call`'s
+`session_id`.
 
-> **`clarify` / input-needed is not currently supported.** The agent emits its
-> clarify event straight to the per-session WebSocket transport and exposes no
-> registerable plugin hook for it, so the plugin cannot observe it. The payload
-> type is reserved for a future hook.
->
 > **Privacy:** the hooks pass message content (`user_message`,
-> `assistant_response`, `conversation_history`) — the plugin reads ONLY
-> `session_id` from them. No content ever leaves the plugin.
+> `assistant_response`, `conversation_history`) and tool args (the clarify
+> `question` / `choices`) — the plugin reads ONLY `session_id` from them. No
+> content ever leaves the plugin.
 
 It uses only Hermes Agent's **public plugin API** (entry-point group
 `hermes_agent.plugins`, `register(ctx)`). It makes **no changes** to
@@ -95,15 +93,14 @@ hermes-agent installed.
 ## Status
 
 Feature-complete and tested. Implemented: the JSON-file token store, the
-trigger→payload mappers (the `pre_approval_request` / `post_llm_call` /
-`on_session_end` hooks), the suppression policy (client-present / duration /
-dedup / no-devices gates), and the outbound `GatewaySender` (off-thread fan-out,
-bounded retries, shared-secret HMAC, HTTP-410 prune). Plus a
-`POST /api/plugins/hermes-push/test` route that fans a sample push through the
-real pipeline (backs the iOS Settings "Send test notification").
-
-**Not supported:** `clarify` / input-needed — no registerable plugin hook exists
-for it today (see Triggers above).
+trigger→payload mappers (the `pre_approval_request` / `pre_tool_call` /
+`post_llm_call` / `on_session_end` hooks), the suppression policy
+(client-present / duration / dedup / no-devices gates), and the outbound
+`GatewaySender` (off-thread fan-out, bounded retries, shared-secret HMAC,
+HTTP-410 prune). Plus a `POST /api/plugins/hermes-push/test` route that fans a
+sample push through the real pipeline (backs the iOS Settings "Send test
+notification"). All four triggers — approval / turn-complete / error / clarify —
+are supported.
 
 ## Configuration
 

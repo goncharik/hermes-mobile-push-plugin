@@ -17,6 +17,7 @@ import hermes_push
 # Hooks this plugin must wire in, matching hermes-agent's VALID_HOOKS.
 EXPECTED_HOOKS = {
     "pre_approval_request",
+    "pre_tool_call",
     "pre_llm_call",
     "post_llm_call",
     "on_session_end",

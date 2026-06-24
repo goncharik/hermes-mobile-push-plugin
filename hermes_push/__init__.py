@@ -18,16 +18,18 @@ Triggers (all via REAL plugin hooks — see hermes-agent ``VALID_HOOKS`` in
   ``run_conversation()`` call. We push an ``error`` only on a genuine failure
   (``completed is False AND interrupted is False``) — success is already covered
   by ``post_llm_call`` and interrupts are user-initiated.
+* **clarify** — ``pre_tool_call`` (observer). Fires for EVERY tool call in BOTH
+  CLI and gateway, with ``tool_name`` / ``args`` / ``session_id``. We filter to
+  ``tool_name == "clarify"`` (the clarify tool fires this BEFORE the user is
+  prompted — the "input needed" moment) and push a generic ``clarify`` (NO
+  question / choices / args). Like approval, clarify is an attention-needed pause
+  and is NOT duration-gated. We always return ``None`` (observer; never block).
 * **turn-start** — ``pre_llm_call`` (observer). Fires once per turn *before* the
   tool-loop, in BOTH CLI and gateway, with ``session_id == agent.session_id``
   (the same key ``post_llm_call`` / ``on_session_end`` use). We record it as the
   policy's turn-start anchor so the complete-push duration gate can measure
   elapsed time. Cleared at ``on_session_end``. (If a turn somehow has no
   recorded start, the policy fails OPEN and notifies.)
-
-``clarify`` / input-needed is **NOT currently supported**: the agent emits it
-straight to the per-session WebSocket transport and exposes no registerable
-plugin hook for it.
 
 Pipeline (wired in :func:`register`)
 ------------------------------------
@@ -63,6 +65,9 @@ logger = logging.getLogger(__name__)
 #
 # * pre_approval_request — approval needed. Observer hook; honors ``surface``
 #                          (gateway → push, cli → skip).
+# * pre_tool_call        — EVERY tool call. Observer hook; we filter to the
+#                          clarify tool → ``clarify`` and always return None
+#                          (never block).
 # * pre_llm_call         — turn START. Observer hook; we record the policy's
 #                          turn-start anchor and inject NO context (return None).
 # * post_llm_call        — turn COMPLETE (success). Observer hook → ``complete``.
@@ -70,6 +75,7 @@ logger = logging.getLogger(__name__)
 #                          failure; always clears the turn-start anchor.
 _TRIGGER_HOOKS = (
     "pre_approval_request",
+    "pre_tool_call",
     "pre_llm_call",
     "post_llm_call",
     "on_session_end",
@@ -166,6 +172,7 @@ def _pipeline(payload: Dict[str, str]) -> None:
 
 _HOOK_HANDLERS = {
     "pre_approval_request": dispatcher.on_pre_approval_request,
+    "pre_tool_call": dispatcher.on_pre_tool_call,
     "pre_llm_call": _on_pre_llm_call,
     "post_llm_call": dispatcher.on_post_llm_call,
     "on_session_end": _on_session_end,

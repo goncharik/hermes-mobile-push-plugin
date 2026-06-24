@@ -24,6 +24,7 @@ from hermes_push.triggers import (
     TriggerDispatcher,
     make_payload,
     map_approval,
+    map_clarify,
     map_complete,
     map_session_end,
 )
@@ -162,6 +163,47 @@ def test_post_llm_call_empty_session_id_is_skipped() -> None:
 
 
 # ---------------------------------------------------------------------------
+# clarify: pre_tool_call hook mapping (filtered to the clarify tool)
+# ---------------------------------------------------------------------------
+
+
+def test_pre_tool_call_clarify_maps_to_clarify() -> None:
+    # The clarify tool's args carry the question/choices — NONE may leak.
+    payload = map_clarify(
+        tool_name="clarify",
+        args={
+            "question": "What is your AWS key?",
+            "choices": ["delete the production db", "Traceback: secret stack"],
+        },
+        session_id="sess-clarify",
+        task_id="t1",
+        turn_id="turn-1",
+        tool_call_id="tc-1",
+    )
+    assert payload is not None
+    _assert_generic_payload(payload, ptype=TYPE_CLARIFY, sid="sess-clarify")
+
+
+def test_pre_tool_call_non_clarify_tool_is_skipped() -> None:
+    # pre_tool_call fires for EVERY tool; only clarify should produce a push.
+    assert map_clarify(tool_name="shell", args={"command": "rm -rf /home/user/secret"},
+                       session_id="s1") is None
+    assert map_clarify(tool_name="", session_id="s1") is None
+    assert map_clarify(session_id="s1") is None  # no tool_name at all
+
+
+def test_pre_tool_call_clarify_session_key_fallback() -> None:
+    payload = map_clarify(tool_name="clarify", session_key="sk")
+    assert payload is not None
+    assert payload["session_id"] == "sk"
+
+
+def test_pre_tool_call_clarify_empty_session_id_is_skipped() -> None:
+    assert map_clarify(tool_name="clarify") is None
+    assert map_clarify(tool_name="clarify", session_id="") is None
+
+
+# ---------------------------------------------------------------------------
 # error: on_session_end hook mapping (only genuine failures push)
 # ---------------------------------------------------------------------------
 
@@ -231,6 +273,28 @@ def test_dispatcher_feeds_complete_payload_to_sink() -> None:
     _assert_generic_payload(collected[0], ptype=TYPE_COMPLETE, sid="s1")
 
 
+def test_dispatcher_feeds_clarify_payload_to_sink() -> None:
+    collected: List[Dict[str, str]] = []
+    d = TriggerDispatcher(sink=collected.append)
+
+    result = d.on_pre_tool_call(
+        tool_name="clarify",
+        args={"question": "What is your AWS key?"},
+        session_id="s1",
+    )
+    assert result is None  # observer hook never blocks the tool
+    assert len(collected) == 1
+    _assert_generic_payload(collected[0], ptype=TYPE_CLARIFY, sid="s1")
+
+
+def test_dispatcher_skips_non_clarify_tool_no_sink_call() -> None:
+    collected: List[Dict[str, str]] = []
+    d = TriggerDispatcher(sink=collected.append)
+
+    assert d.on_pre_tool_call(tool_name="shell", args={"command": "x"}, session_id="s1") is None
+    assert collected == []
+
+
 def test_dispatcher_feeds_error_only_on_failure() -> None:
     collected: List[Dict[str, str]] = []
     d = TriggerDispatcher(sink=collected.append)
@@ -247,6 +311,7 @@ def test_dispatcher_default_sink_is_noop_safe() -> None:
     # No sink injected → drops payloads without raising.
     d = TriggerDispatcher()
     d.on_pre_approval_request(surface="gateway", session_key="s1")
+    d.on_pre_tool_call(tool_name="clarify", session_id="s1")  # must not raise
     d.on_post_llm_call(session_id="s1")  # must not raise
     d.on_session_end(session_id="s1", completed=False, interrupted=False)
 
@@ -258,6 +323,7 @@ def test_dispatcher_swallows_sink_errors() -> None:
     d = TriggerDispatcher(sink=boom)
     # A failing sink must never propagate into the host hook thread.
     assert d.on_pre_approval_request(surface="gateway", session_key="s1") is None
+    assert d.on_pre_tool_call(tool_name="clarify", session_id="s1") is None
     assert d.on_post_llm_call(session_id="s1") is None
     assert d.on_session_end(session_id="s1", completed=False, interrupted=False) is None
 
