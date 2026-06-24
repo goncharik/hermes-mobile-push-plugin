@@ -1,10 +1,10 @@
-"""Tests for the B3 trigger → generic-payload mapping layer.
+"""Tests for the trigger → generic-payload mapping layer.
 
-Covers all four trigger types (approval, clarify, complete, error), the
-approval ``surface`` gating (gateway → mapped, cli → skipped), the loopback WS
-event mapper (for complete/error/clarify, which have no hook path), and the
-privacy rule: no message content / args / reasoning / command / question may
-leak into a payload.
+Covers the payload types (approval, clarify, complete, error), the approval
+``surface`` gating (gateway → mapped, cli → skipped), the ``post_llm_call`` →
+complete and ``on_session_end`` → error hook mappers, and the privacy rule: no
+message content / args / reasoning / command / assistant response may leak into a
+payload.
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ from hermes_push.triggers import (
     TriggerDispatcher,
     make_payload,
     map_approval,
-    map_ws_event,
+    map_complete,
+    map_session_end,
 )
 
 
@@ -33,9 +34,9 @@ from hermes_push.triggers import (
 _SECRET_STRINGS = (
     "rm -rf /home/user/secret",   # approval command
     "delete the production db",   # approval description
-    "What is your AWS key?",      # clarify question
-    "Traceback: secret stack",    # error message
-    "Here is the answer: 42 …",   # completed message text
+    "What is your AWS key?",      # user_message
+    "Traceback: secret stack",    # error / failure detail
+    "Here is the answer: 42 …",   # assistant_response text
     "<reasoning> chain </reasoning>",
 )
 
@@ -128,77 +129,69 @@ def test_approval_empty_session_id_is_skipped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# complete / error / clarify: loopback WS event mapping
+# complete: post_llm_call hook mapping (reads only session_id, never content)
 # ---------------------------------------------------------------------------
 
 
-def _event_frame(event_type: str, sid: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """Build a gateway event frame as tui_gateway/server.py::_emit writes it."""
-    params: Dict[str, Any] = {"type": event_type, "session_id": sid}
-    if payload is not None:
-        params["payload"] = payload
-    return {"jsonrpc": "2.0", "method": "event", "params": params}
-
-
-def test_ws_message_complete_maps_to_complete() -> None:
-    frame = _event_frame(
-        "message.complete",
-        "sess-c",
-        # The real complete payload carries the rendered message + reasoning —
-        # none of it may leak.
-        payload={
-            "rendered": "Here is the answer: 42 …",
-            "reasoning": "<reasoning> chain </reasoning>",
-        },
+def test_post_llm_call_maps_to_complete() -> None:
+    # post_llm_call fires with user_message / assistant_response / history; NONE
+    # of it may leak into the generic payload.
+    payload = map_complete(
+        session_id="sess-c",
+        task_id="t1",
+        turn_id="turn-1",
+        user_message="What is your AWS key?",
+        assistant_response="Here is the answer: 42 …",
+        conversation_history=[{"role": "assistant", "reasoning": "<reasoning> chain </reasoning>"}],
+        model="gpt-4",
+        platform="gateway",
     )
-    payload = map_ws_event(frame)
     assert payload is not None
     _assert_generic_payload(payload, ptype=TYPE_COMPLETE, sid="sess-c")
 
 
-def test_ws_error_maps_to_error() -> None:
-    frame = _event_frame("error", "sess-e", payload={"message": "Traceback: secret stack"})
-    payload = map_ws_event(frame)
+def test_post_llm_call_session_key_fallback() -> None:
+    payload = map_complete(session_key="sk")
+    assert payload is not None
+    assert payload["session_id"] == "sk"
+
+
+def test_post_llm_call_empty_session_id_is_skipped() -> None:
+    assert map_complete() is None
+    assert map_complete(session_id="") is None
+
+
+# ---------------------------------------------------------------------------
+# error: on_session_end hook mapping (only genuine failures push)
+# ---------------------------------------------------------------------------
+
+
+def test_session_end_failure_maps_to_error() -> None:
+    payload = map_session_end(
+        session_id="sess-e",
+        completed=False,
+        interrupted=False,
+        model="gpt-4",
+        platform="gateway",
+    )
     assert payload is not None
     _assert_generic_payload(payload, ptype=TYPE_ERROR, sid="sess-e")
 
 
-def test_ws_clarify_request_maps_to_clarify() -> None:
-    frame = _event_frame(
-        "clarify.request",
-        "sess-q",
-        payload={"question": "What is your AWS key?", "choices": ["a", "b"]},
-    )
-    payload = map_ws_event(frame)
-    assert payload is not None
-    _assert_generic_payload(payload, ptype=TYPE_CLARIFY, sid="sess-q")
+def test_session_end_success_produces_no_error() -> None:
+    # Success is already covered by post_llm_call's complete push.
+    assert map_session_end(session_id="s", completed=True, interrupted=False) is None
 
 
-def test_ws_accepts_bare_params_dict() -> None:
-    # The mapper tolerates being handed just the params sub-object.
-    payload = map_ws_event({"type": "error", "session_id": "s-bare"})
-    assert payload is not None
-    assert payload["type"] == TYPE_ERROR
-    assert payload["session_id"] == "s-bare"
+def test_session_end_interrupted_produces_no_error() -> None:
+    # User-initiated stop — never notify, even if not "completed".
+    assert map_session_end(session_id="s", completed=False, interrupted=True) is None
+    assert map_session_end(session_id="s", completed=True, interrupted=True) is None
 
 
-@pytest.mark.parametrize(
-    "ignored_type",
-    ["message.delta", "message.start", "status.update", "tool.start", "session.info", ""],
-)
-def test_ws_ignores_non_trigger_events(ignored_type: str) -> None:
-    assert map_ws_event(_event_frame(ignored_type, "s1")) is None
-
-
-def test_ws_ignores_non_dict_frame() -> None:
-    assert map_ws_event(None) is None  # type: ignore[arg-type]
-    assert map_ws_event("not a frame") is None  # type: ignore[arg-type]
-
-
-def test_ws_empty_session_id_is_skipped() -> None:
-    # Empty session_id → gateway 400 → silent drop. Skip the push instead.
-    assert map_ws_event({"type": "message.complete", "session_id": ""}) is None
-    assert map_ws_event({"type": "message.complete"}) is None
+def test_session_end_failure_empty_session_id_is_skipped() -> None:
+    assert map_session_end(completed=False, interrupted=False) is None
+    assert map_session_end(session_id="", completed=False, interrupted=False) is None
 
 
 # ---------------------------------------------------------------------------
@@ -224,22 +217,38 @@ def test_dispatcher_skips_cli_approval_no_sink_call() -> None:
     assert collected == []
 
 
-def test_dispatcher_handles_ws_events() -> None:
+def test_dispatcher_feeds_complete_payload_to_sink() -> None:
     collected: List[Dict[str, str]] = []
     d = TriggerDispatcher(sink=collected.append)
 
-    d.handle_ws_event(_event_frame("clarify.request", "sq", payload={"question": "secret?"}))
-    d.handle_ws_event(_event_frame("message.delta", "sq"))  # ignored
-    d.handle_ws_event(_event_frame("error", "se"))
+    result = d.on_post_llm_call(
+        session_id="s1",
+        user_message="What is your AWS key?",
+        assistant_response="Here is the answer: 42 …",
+    )
+    assert result is None
+    assert len(collected) == 1
+    _assert_generic_payload(collected[0], ptype=TYPE_COMPLETE, sid="s1")
 
-    assert [p["type"] for p in collected] == [TYPE_CLARIFY, TYPE_ERROR]
+
+def test_dispatcher_feeds_error_only_on_failure() -> None:
+    collected: List[Dict[str, str]] = []
+    d = TriggerDispatcher(sink=collected.append)
+
+    assert d.on_session_end(session_id="ok", completed=True, interrupted=False) is None
+    assert d.on_session_end(session_id="int", completed=False, interrupted=True) is None
+    assert d.on_session_end(session_id="fail", completed=False, interrupted=False) is None
+
+    assert [p["type"] for p in collected] == [TYPE_ERROR]
+    assert collected[0]["session_id"] == "fail"
 
 
 def test_dispatcher_default_sink_is_noop_safe() -> None:
     # No sink injected → drops payloads without raising.
     d = TriggerDispatcher()
     d.on_pre_approval_request(surface="gateway", session_key="s1")
-    d.handle_ws_event(_event_frame("error", "se"))  # must not raise
+    d.on_post_llm_call(session_id="s1")  # must not raise
+    d.on_session_end(session_id="s1", completed=False, interrupted=False)
 
 
 def test_dispatcher_swallows_sink_errors() -> None:
@@ -249,7 +258,8 @@ def test_dispatcher_swallows_sink_errors() -> None:
     d = TriggerDispatcher(sink=boom)
     # A failing sink must never propagate into the host hook thread.
     assert d.on_pre_approval_request(surface="gateway", session_key="s1") is None
-    d.handle_ws_event(_event_frame("error", "se"))
+    assert d.on_post_llm_call(session_id="s1") is None
+    assert d.on_session_end(session_id="s1", completed=False, interrupted=False) is None
 
 
 def test_set_sink_replaces_sink() -> None:
@@ -270,10 +280,6 @@ def test_set_sink_replaces_sink() -> None:
 
 def test_register_binds_approval_hook_to_dispatcher(monkeypatch) -> None:
     import hermes_push
-    from hermes_push.wsclient import LoopbackWsConnector
-
-    # Keep register() hermetic: no real loopback WS reader thread.
-    monkeypatch.setattr(LoopbackWsConnector, "start", lambda self: None)
 
     collected: List[Dict[str, str]] = []
     try:

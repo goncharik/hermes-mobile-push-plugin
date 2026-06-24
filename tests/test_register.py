@@ -12,19 +12,13 @@ from pathlib import Path
 import pytest
 
 import hermes_push
-from hermes_push.wsclient import LoopbackWsConnector
-
-
-@pytest.fixture(autouse=True)
-def _no_ws_thread(monkeypatch):
-    """Keep register() hermetic: don't spawn the real loopback WS reader thread."""
-    monkeypatch.setattr(LoopbackWsConnector, "start", lambda self: None)
 
 
 # Hooks this plugin must wire in, matching hermes-agent's VALID_HOOKS.
 EXPECTED_HOOKS = {
     "pre_approval_request",
-    "pre_gateway_dispatch",
+    "pre_llm_call",
+    "post_llm_call",
     "on_session_end",
 }
 
@@ -61,10 +55,10 @@ def test_register_does_not_raise_with_minimal_ctx():
 
 
 def test_hook_handlers_are_noop_safe():
-    """Placeholder handlers must accept arbitrary kwargs and never alter flow.
+    """Observer handlers must accept arbitrary kwargs and never alter flow.
 
-    Returning a non-None dict from pre_gateway_dispatch could skip/rewrite a
-    user message — guard against that regression.
+    Every hook handler returns None (observers); pre_llm_call in particular must
+    never return a context dict that would mutate the user message.
     """
     ctx = FakeCtx()
     hermes_push.register(ctx)

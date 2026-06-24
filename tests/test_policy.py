@@ -102,32 +102,31 @@ def test_client_present_is_keyed_by_session():
 
 
 # ---------------------------------------------------------------------------
-# Gate 3 — duration gate (complete / error only)
+# Gate 3 — duration gate (complete only)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ptype", [TYPE_COMPLETE, TYPE_ERROR])
-def test_short_turn_suppresses_complete_and_error(ptype):
+def test_short_turn_suppresses_complete():
     clock = FakeClock()
     policy = _policy(clock=clock)
     policy.note_turn_start(SID)
     clock.advance(DEFAULT_DURATION_THRESHOLD_S)  # exactly threshold -> not > threshold
-    decision = policy.decide(make_payload(ptype, SID))
+    decision = policy.decide(make_payload(TYPE_COMPLETE, SID))
     assert decision == Decision(send=False, reason="short_turn")
 
 
-@pytest.mark.parametrize("ptype", [TYPE_COMPLETE, TYPE_ERROR])
-def test_long_turn_allows_complete_and_error(ptype):
+def test_long_turn_allows_complete():
     clock = FakeClock()
     policy = _policy(clock=clock)
     policy.note_turn_start(SID)
     clock.advance(DEFAULT_DURATION_THRESHOLD_S + 0.5)  # over threshold
-    assert policy.should_send(make_payload(ptype, SID)) is True
+    assert policy.should_send(make_payload(TYPE_COMPLETE, SID)) is True
 
 
-@pytest.mark.parametrize("ptype", [TYPE_APPROVAL, TYPE_CLARIFY])
-def test_approval_and_clarify_are_not_duration_gated(ptype):
-    # A near-instant turn still pushes for approval / clarify.
+@pytest.mark.parametrize("ptype", [TYPE_APPROVAL, TYPE_CLARIFY, TYPE_ERROR])
+def test_approval_clarify_and_error_are_not_duration_gated(ptype):
+    # A near-instant turn still pushes for approval / clarify, and a genuine
+    # error is worth surfacing even on a short turn.
     clock = FakeClock()
     policy = _policy(clock=clock)
     policy.note_turn_start(SID)

@@ -15,16 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional: enables the loopback /api/ws connector for complete/error/clarify
-# triggers. The plugin degrades gracefully (approval-via-hook still works) when
-# it is absent, so it is not a hard runtime dependency.
-ws = [
-    "websockets",
-]
 test = [
     "pytest",
     "httpx",
-    "websockets",
 ]
 
 # Hermes discovers pip-installed plugins via this entry-point group. The host

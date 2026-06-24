@@ -1,23 +1,18 @@
-"""Tests for the __init__ pipeline wiring + loopback WS connector (Task B5).
+"""Tests for the __init__ pipeline wiring.
 
-Hermetic: no network, no real ``websockets`` socket. We mock the HTTP client,
-point the store at a tmp dir, and feed the WS connector a fake connection.
+Hermetic: no network. We mock the HTTP client and point the store at a tmp dir.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-from typing import Any, List
-
-import pytest
+from typing import List
 
 import hermes_push
 from hermes_push.policy import SuppressionPolicy
 from hermes_push.sender import GatewaySender, HttpResponse
 from hermes_push.store import TokenStore
 from hermes_push.triggers import TriggerDispatcher
-from hermes_push.wsclient import LoopbackWsConnector, build_ws_url
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +71,11 @@ def test_pipeline_noop_when_unwired(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# All four trigger types deliver through the full local pipeline
-# (trigger source → dispatcher → _pipeline → policy → GatewaySender → gateway
-#  request). Approval enters via the hook path; complete/error/clarify enter via
-# the loopback-WS event mapper. This is the cross-component "all four deliver"
-# acceptance check (C8): each produces a correct, generic gateway request whose
-# top-level `type` the gateway echoes into APNs (gateway/src/apnsSend.ts) so the
-# app can badge approvals.
+# The trigger types deliver through the full local pipeline
+# (hook → dispatcher → _pipeline → policy → GatewaySender → gateway request).
+# Approval enters via pre_approval_request, complete via post_llm_call, and
+# error via on_session_end. Each produces a correct, generic gateway request
+# whose top-level `type` the gateway echoes into APNs (gateway/src/apnsSend.ts).
 # ---------------------------------------------------------------------------
 
 
@@ -137,33 +130,44 @@ def test_approval_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
     assert "hmac" in req  # signed with the shared secret
 
 
-@pytest.mark.parametrize(
-    "ws_type,expected",
-    [("message.complete", "complete"), ("error", "error"), ("clarify.request", "clarify")],
-)
-def test_ws_triggers_deliver_through_pipeline(monkeypatch, tmp_path, ws_type, expected):
-    """complete/error/clarify enter via the loopback-WS mapper and reach the gateway."""
+def test_complete_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
+    """post_llm_call → complete reaches the gateway, leaking no content."""
     http = _RecordingHttp()
     dispatcher, sender = _wire_real_pipeline(monkeypatch, tmp_path, http=http)
 
-    frame = json.dumps({"method": "event", "params": {"type": ws_type, "session_id": "sx",
-                                                       "payload": {"message": "SECRET CONTENT"}}})
-    # The connector forwards raw frames to dispatcher.handle_ws_event, which maps
-    # and feeds the sink (_pipeline) → policy → sender (executor). Then assert the
-    # gateway request shape synchronously via the same sender.
-    _run_connector([frame], on_frame=dispatcher.handle_ws_event)
-    from hermes_push.triggers import map_ws_event
+    # post_llm_call carries user_message / assistant_response — none may leak.
+    dispatcher.on_post_llm_call(
+        session_id="sx",
+        user_message="SECRET CONTENT",
+        assistant_response="SECRET CONTENT",
+    )
+    from hermes_push.triggers import map_complete
 
-    payload = map_ws_event({"type": ws_type, "session_id": "sx",
-                            "payload": {"message": "SECRET CONTENT"}})
+    payload = map_complete(session_id="sx", assistant_response="SECRET CONTENT")
     sender.send_blocking(payload)
 
-    assert http.bodies, f"{ws_type} did not reach the gateway"
+    assert http.bodies, "complete did not reach the gateway"
     req = http.bodies[-1]
-    assert req["type"] == expected
+    assert req["type"] == "complete"
     assert req["session_id"] == "sx"
-    # Privacy: no message content may transit.
     assert "SECRET CONTENT" not in json.dumps(req)
+
+
+def test_error_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
+    """on_session_end failure → error reaches the gateway."""
+    http = _RecordingHttp()
+    dispatcher, sender = _wire_real_pipeline(monkeypatch, tmp_path, http=http)
+
+    dispatcher.on_session_end(session_id="sx", completed=False, interrupted=False)
+    from hermes_push.triggers import map_session_end
+
+    payload = map_session_end(session_id="sx", completed=False, interrupted=False)
+    sender.send_blocking(payload)
+
+    assert http.bodies, "error did not reach the gateway"
+    req = http.bodies[-1]
+    assert req["type"] == "error"
+    assert req["session_id"] == "sx"
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +184,6 @@ class FakeCtx:
 
 
 def test_register_stands_up_store_policy_sender(monkeypatch):
-    # Don't actually spawn the WS thread during the test.
-    monkeypatch.setattr(LoopbackWsConnector, "start", lambda self: None)
-
     ctx = FakeCtx()
     hermes_push.register(ctx)
 
@@ -208,170 +209,60 @@ def test_register_survives_pipeline_failure(monkeypatch):
     hermes_push.register(ctx)
     assert set(ctx.hooks) == {
         "pre_approval_request",
-        "pre_gateway_dispatch",
+        "pre_llm_call",
+        "post_llm_call",
         "on_session_end",
     }
 
 
 # ---------------------------------------------------------------------------
-# Loopback WS connector — hermetic (fake connection, no real socket)
+# Turn-start anchor + duration gate (pre_llm_call → note, complete gate)
 # ---------------------------------------------------------------------------
 
 
-class FakeWs:
-    """An async-iterable fake WS yielding pre-scripted frames, then signals stop.
+def test_pre_llm_call_records_turn_start_then_gate(monkeypatch, tmp_path):
+    """pre_llm_call notes the anchor; a short turn's complete push is gated."""
+    http = _RecordingHttp()
+    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
+    store = TokenStore(base_dir=tmp_path)
+    store.upsert(device_token="dt", apns_env="production", app_version="1")
 
-    On context exit (after all frames are drained) it sets the connector's stop
-    event so the reader loop exits without reconnecting — giving deterministic,
-    single-pass tests.
-    """
-
-    def __init__(self, frames: List[str], stop) -> None:
-        self._frames = list(frames)
-        self._stop = stop
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        self._stop.set()
-        return False
-
-    def __aiter__(self):
-        return self._gen()
-
-    async def _gen(self):
-        for f in self._frames:
-            yield f
-
-
-def _run_connector(frames, on_frame, on_turn_start=None, on_turn_end=None):
-    """Drive one connector pass synchronously with a fake connect()."""
-    connector = LoopbackWsConnector(
-        on_frame=on_frame,
-        on_turn_start=on_turn_start,
-        on_turn_end=on_turn_end,
-        url_factory=lambda: "ws://127.0.0.1:8080/api/ws?token=t",
-        reconnect_delay_s=0.0,
+    fake_now = {"t": 0.0}
+    policy = SuppressionPolicy(
+        client_present=lambda _sid: False,
+        device_count=lambda: len(store.list_all()),
+        clock=lambda: fake_now["t"],
     )
-    fake_connect = lambda url: FakeWs(frames, connector._stop)
-    asyncio.run(connector._reader_loop(fake_connect))
+    sender = GatewaySender(store=store, http_client=http, max_attempts=1, backoff_base_s=0.0)
+    monkeypatch.setattr(hermes_push, "_store", store)
+    monkeypatch.setattr(hermes_push, "_policy", policy)
+    monkeypatch.setattr(hermes_push, "_sender", sender)
+
+    # Turn starts at t=0.
+    hermes_push._on_pre_llm_call(session_id="sd")
+    # Short turn (2s) — complete is duration-gated and suppressed.
+    fake_now["t"] = 2.0
+    assert policy.decide(
+        {"type": "complete", "session_id": "sd"}
+    ).reason == "short_turn"
+
+    # Long turn (15s) — complete passes the gate.
+    hermes_push._on_pre_llm_call(session_id="sd")
+    fake_now["t"] = 17.0
+    assert policy.decide({"type": "complete", "session_id": "sd"}).send is True
 
 
-def test_ws_connector_maps_complete_event_into_dispatcher():
-    received: List[dict] = []
-    dispatcher = TriggerDispatcher()
-    dispatcher.set_sink(received.append)
-
-    frame = json.dumps(
-        {"method": "event", "params": {"type": "message.complete", "session_id": "s9"}}
+def test_on_session_end_clears_turn_start(monkeypatch, tmp_path):
+    store = TokenStore(base_dir=tmp_path)
+    policy = SuppressionPolicy(
+        client_present=lambda _sid: False,
+        device_count=lambda: 1,
     )
-    _run_connector([frame], on_frame=dispatcher.handle_ws_event)
+    monkeypatch.setattr(hermes_push, "_store", store)
+    monkeypatch.setattr(hermes_push, "_policy", policy)
+    monkeypatch.setattr(hermes_push, "_sender", _CountingSink())
 
-    assert len(received) == 1
-    assert received[0]["type"] == "complete"
-    assert received[0]["session_id"] == "s9"
-
-
-def test_ws_connector_ignores_non_trigger_events():
-    received: List[dict] = []
-    dispatcher = TriggerDispatcher()
-    dispatcher.set_sink(received.append)
-
-    frames = [
-        json.dumps({"method": "event", "params": {"type": "status.update", "session_id": "s"}}),
-        json.dumps({"method": "event", "params": {"type": "tool.start", "session_id": "s"}}),
-        "not json",
-        json.dumps(["unexpected", "shape"]),
-    ]
-    _run_connector(frames, on_frame=dispatcher.handle_ws_event)
-    assert received == []
-
-
-def test_ws_connector_feeds_turn_lifecycle_signals():
-    starts: List[str] = []
-    ends: List[str] = []
-    frames = [
-        json.dumps({"method": "event", "params": {"type": "message.start", "session_id": "s1"}}),
-        json.dumps({"method": "event", "params": {"type": "message.complete", "session_id": "s1"}}),
-        json.dumps({"method": "event", "params": {"type": "error", "session_id": "s2"}}),
-    ]
-    _run_connector(
-        frames,
-        on_frame=lambda _f: None,
-        on_turn_start=starts.append,
-        on_turn_end=ends.append,
-    )
-    assert starts == ["s1"]
-    assert ends == ["s1", "s2"]
-
-
-def test_ws_connector_degrades_when_no_websockets(monkeypatch):
-    """No injected connect + no 'websockets' module → connector is a quiet no-op."""
-    connector = LoopbackWsConnector(on_frame=lambda _f: None)
-
-    import builtins
-
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "websockets":
-            raise ImportError("no websockets")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    assert connector._resolve_connect() is None
-    # _run with no connect available must return without raising.
-    connector._run()
-
-
-def test_ws_connector_connection_error_is_swallowed():
-    """A failing connect() must not raise out of the reader loop."""
-    def bad_connect(url):
-        raise OSError("connection refused")
-
-    connector = LoopbackWsConnector(
-        on_frame=lambda _f: None,
-        url_factory=lambda: "ws://127.0.0.1:8080/api/ws",
-        connect=bad_connect,
-        reconnect_delay_s=0.0,
-    )
-    connector._stop.set()  # one pass only
-    # Should complete without raising.
-    asyncio.run(connector._reader_loop(bad_connect))
-
-
-# ---------------------------------------------------------------------------
-# build_ws_url
-# ---------------------------------------------------------------------------
-
-
-def test_build_ws_url_default(monkeypatch):
-    for k in ("HERMES_PUSH_WS_URL", "HERMES_DASHBOARD_URL", "HERMES_DASHBOARD_HOST",
-              "HERMES_DASHBOARD_PORT", "HERMES_DASHBOARD_SESSION_TOKEN"):
-        monkeypatch.delenv(k, raising=False)
-    url = build_ws_url()
-    assert url == "ws://127.0.0.1:8080/api/ws"
-
-
-def test_build_ws_url_appends_token(monkeypatch):
-    monkeypatch.delenv("HERMES_PUSH_WS_URL", raising=False)
-    monkeypatch.delenv("HERMES_DASHBOARD_URL", raising=False)
-    monkeypatch.setenv("HERMES_DASHBOARD_HOST", "127.0.0.1")
-    monkeypatch.setenv("HERMES_DASHBOARD_PORT", "9000")
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok123")
-    url = build_ws_url()
-    assert url == "ws://127.0.0.1:9000/api/ws?token=tok123"
-
-
-def test_build_ws_url_explicit_override(monkeypatch):
-    monkeypatch.setenv("HERMES_PUSH_WS_URL", "ws://example:1234/api/ws")
-    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
-    assert build_ws_url() == "ws://example:1234/api/ws"
-
-
-def test_build_ws_url_from_https_dashboard(monkeypatch):
-    monkeypatch.delenv("HERMES_PUSH_WS_URL", raising=False)
-    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
-    monkeypatch.setenv("HERMES_DASHBOARD_URL", "https://agent.local:8443")
-    assert build_ws_url() == "wss://agent.local:8443/api/ws"
+    policy.note_turn_start("sd")
+    assert "sd" in policy._turn_starts
+    hermes_push._on_session_end(session_id="sd", completed=True, interrupted=False)
+    assert "sd" not in policy._turn_starts

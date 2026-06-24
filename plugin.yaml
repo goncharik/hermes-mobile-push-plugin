@@ -5,5 +5,6 @@ author: "Hermes Mobile"
 kind: standalone
 hooks:
   - pre_approval_request
-  - pre_gateway_dispatch
+  - pre_llm_call
+  - post_llm_call
   - on_session_end

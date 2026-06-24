@@ -1,43 +1,45 @@
-"""Trigger hooks → generic push-payload mapping (Task B3).
+"""Trigger hooks → generic push-payload mapping.
 
-This is the *mapping* layer of the plugin. It turns each of the four trigger
-events the iOS app cares about into a generic, privacy-safe payload dict and
-hands it to an injectable **sink** (a callback). Suppression/dedup (B4) and the
-outbound POST to the gateway (B5) plug in behind that sink later; for B3 the
-sink is a no-op/collector.
+This is the *mapping* layer of the plugin. It turns each trigger event the iOS
+app cares about into a generic, privacy-safe payload dict and hands it to an
+injectable **sink** (a callback). The suppression policy (``policy.py``) and the
+outbound POST to the gateway (``sender.py``) plug in behind that sink.
 
 Privacy rule (hard requirement)
 -------------------------------
 Only a generic ``{type, session_id, title, body, thread_id}`` ever leaves this
 plugin. We **never** copy message content, tool args, reasoning text, the
-approval command, or the clarify question into the payload. ``title``/``body``
-are fixed constants (see :data:`TITLES` / :data:`BODIES`) so tests can assert
-them and a future translator has one place to look. The real content is fetched
-in-app over Tailscale once the user taps the notification.
+approval command, the assistant response, or conversation history into the
+payload. ``title``/``body`` are fixed constants (see :data:`TITLES` /
+:data:`BODIES`) so tests can assert them and a future translator has one place to
+look. The real content is fetched in-app over Tailscale once the user taps the
+notification.
 
-How the four events surface (verified against hermes-agent — see
-docs/plans/2026-06-20-push-notifications.md and the B3 progress note)
---------------------------------------------------------------------
-* **approval** — the ``pre_approval_request`` hook
-  (``tools/approval.py``). It is an *observer* hook fired both for CLI prompts
-  and for gateway/remote approvals, exposing ``surface`` ("cli" | "gateway")
-  and ``session_key`` (== the gateway ``session_id``). We push only for
-  gateway/remote surfaces and ignore CLI-only requests.
+How the events surface (verified against hermes-agent — see STEP 0 findings)
+----------------------------------------------------------------------------
+* **approval** — the ``pre_approval_request`` hook (``tools/approval.py``). An
+  *observer* hook fired both for CLI prompts and gateway/remote approvals,
+  exposing ``surface`` ("cli" | "gateway") and ``session_key`` (== the gateway
+  ``session_id``). We push only for gateway/remote surfaces and ignore CLI-only
+  requests.
 
-* **complete / error / clarify** — these are emitted by the gateway via
-  ``_emit(...)`` (``tui_gateway/server.py``) straight to the WebSocket
-  transport; they do **NOT** pass through any registerable plugin hook
-  (``pre_gateway_dispatch`` only sees *incoming* user ``MessageEvent``\\s, never
-  outbound events). So there is no hook path for them. We therefore use a thin,
-  read-only loopback WebSocket client to the agent's local ``/api/ws`` sidecar
-  that watches the event stream and maps the relevant event frames. That client
-  lives in :func:`map_ws_event` (the pure mapper, fully unit-tested) plus an
-  optional, guarded connector that is OFF the hook thread and degrades to a
-  no-op if the WS isn't reachable. The exact event ``type`` strings are
-  ``"message.complete"``, ``"error"`` and ``"clarify.request"``.
+* **complete** — the ``post_llm_call`` hook (``agent/conversation_loop.py``),
+  fired once per turn after the tool-loop finishes and a final assistant
+  response is produced, in BOTH CLI and gateway. We read ONLY ``session_id``
+  from it (never ``user_message`` / ``assistant_response`` / ``conversation_history``).
 
-This module keeps the *pure* mapping (hook kwargs / event frame → payload)
-separate from any I/O so the suite can assert payloads without a running agent.
+* **error** — the ``on_session_end`` hook (``agent/conversation_loop.py``),
+  fired at the end of every ``run_conversation()`` call. We push only on a
+  genuine failure (``completed is False AND interrupted is False``); success is
+  already covered by ``post_llm_call`` and interrupts are user-initiated.
+
+* **clarify** — NOT currently supported. The agent's clarify/input-needed event
+  is emitted straight to the per-session WebSocket transport and has no
+  registerable plugin hook, so the plugin cannot observe it. The ``clarify``
+  payload type is kept here for forward-compatibility but nothing maps to it.
+
+This module keeps the *pure* mapping (hook kwargs → payload) separate from any
+I/O so the suite can assert payloads without a running agent.
 """
 
 from __future__ import annotations
@@ -61,7 +63,9 @@ def _noop_sink(_payload: Dict[str, str]) -> None:
 # Payload type tags + generic (content-free) copy
 # ---------------------------------------------------------------------------
 
-# The four payload ``type`` values, matching the gateway-fn / iOS contract.
+# The payload ``type`` values, matching the gateway-fn / iOS contract.
+# ``clarify`` is kept for forward-compatibility but is NOT currently produced —
+# the agent's clarify event has no registerable plugin hook (see module docstring).
 TYPE_APPROVAL = "approval"
 TYPE_CLARIFY = "clarify"
 TYPE_COMPLETE = "complete"
@@ -82,14 +86,6 @@ BODIES: Dict[str, str] = {
     TYPE_CLARIFY: "Hermes needs more information",
     TYPE_COMPLETE: "Hermes finished the turn",
     TYPE_ERROR: "Hermes ran into a problem",
-}
-
-# Gateway event ``type`` strings (tui_gateway/server.py::_emit) → our payload
-# type tag. Only these three outbound events map; everything else is ignored.
-WS_EVENT_TYPE_MAP: Dict[str, str] = {
-    "message.complete": TYPE_COMPLETE,
-    "error": TYPE_ERROR,
-    "clarify.request": TYPE_CLARIFY,
 }
 
 # The approval surfaces we push for. CLI-interactive approvals are answered at
@@ -139,25 +135,19 @@ def _approval_session_id(kwargs: Dict[str, Any]) -> str:
     return str(sid)
 
 
-def _event_session_id(frame: Dict[str, Any]) -> str:
-    """Pull ``session_id`` from a gateway event frame.
+def _hook_session_id(kwargs: Dict[str, Any]) -> str:
+    """Pull ``session_id`` from a ``post_llm_call`` / ``on_session_end`` hook.
 
-    ``_emit`` puts it on ``params`` (``{"method":"event","params":{"type":...,
-    "session_id":...}}``). We accept either a full frame or a bare ``params``
-    dict, and never read the ``payload`` (content) sub-object.
+    Both fire with ``session_id=agent.session_id`` (the same key the gateway uses
+    for ``pre_approval_request``\\'s ``session_key`` and the WS frame, so push
+    threads collapse correctly). We read ONLY the id — never the message content.
     """
-    params = frame.get("params") if isinstance(frame.get("params"), dict) else frame
-    sid = params.get("session_id") or ""
+    sid = kwargs.get("session_id") or kwargs.get("session_key") or ""
     return str(sid)
 
 
-def _event_type(frame: Dict[str, Any]) -> str:
-    params = frame.get("params") if isinstance(frame.get("params"), dict) else frame
-    return str(params.get("type") or "")
-
-
 # ---------------------------------------------------------------------------
-# Mappers (hook kwargs / event frame → payload, or None to skip)
+# Mappers (hook kwargs → payload, or None to skip)
 # ---------------------------------------------------------------------------
 
 
@@ -178,23 +168,39 @@ def map_approval(**kwargs: Any) -> Optional[Dict[str, str]]:
     return make_payload(TYPE_APPROVAL, session_id)
 
 
-def map_ws_event(frame: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """Map a gateway ``/api/ws`` event frame → payload, or ``None`` to ignore.
+def map_complete(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Map a ``post_llm_call`` hook invocation → a generic ``complete`` payload.
 
-    Only ``message.complete`` / ``error`` / ``clarify.request`` map; every other
-    event type (deltas, status, tool, etc.) is ignored. Reads only ``type`` and
-    ``session_id`` from the frame — never the content ``payload``.
+    Fired once per successful turn (CLI + gateway). Reads ONLY ``session_id`` —
+    NEVER ``user_message`` / ``assistant_response`` / ``conversation_history``
+    (privacy rule). Returns ``None`` if no session id is available.
     """
-    if not isinstance(frame, dict):
-        return None
-    payload_type = WS_EVENT_TYPE_MAP.get(_event_type(frame))
-    if payload_type is None:
-        return None
-    session_id = _event_session_id(frame)
+    session_id = _hook_session_id(kwargs)
     if not session_id:
-        # Empty session_id → gateway 400 → silent drop. Skip instead.
         return None
-    return make_payload(payload_type, session_id)
+    return make_payload(TYPE_COMPLETE, session_id)
+
+
+def map_session_end(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Map an ``on_session_end`` hook invocation → an ``error`` payload, or skip.
+
+    ``on_session_end`` fires at the end of EVERY ``run_conversation()`` call —
+    success, failure, and interrupt alike. We map to an ``error`` push ONLY on a
+    genuine failure (``completed is False AND interrupted is False``):
+
+    * success → ``post_llm_call`` already produced a ``complete`` push, so skip.
+    * interrupted → user-initiated stop; never notify.
+
+    Reads only ``completed`` / ``interrupted`` / ``session_id`` — never content.
+    """
+    completed = bool(kwargs.get("completed"))
+    interrupted = bool(kwargs.get("interrupted"))
+    if completed or interrupted:
+        return None
+    session_id = _hook_session_id(kwargs)
+    if not session_id:
+        return None
+    return make_payload(TYPE_ERROR, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +211,11 @@ def map_ws_event(frame: Dict[str, Any]) -> Optional[Dict[str, str]]:
 class TriggerDispatcher:
     """Owns the push sink and turns surfaced events into payloads.
 
-    B3 wires the ``pre_approval_request`` hook callback and exposes
-    :meth:`handle_ws_event` for the loopback WS client. Each mapped payload is
-    handed to the injectable ``sink``; the default no-op makes the dispatcher
-    safe to attach before B4/B5 exist. The dispatcher never raises into the
-    host — a sink failure is logged and swallowed so it can never disrupt a
-    turn.
+    Wires the ``pre_approval_request`` / ``post_llm_call`` / ``on_session_end``
+    hook callbacks. Each mapped payload is handed to the injectable ``sink``; the
+    default no-op makes the dispatcher safe to attach before the pipeline is
+    wired. The dispatcher never raises into the host — a sink failure is logged
+    and swallowed so it can never disrupt a turn.
     """
 
     def __init__(self, sink: Optional[PushSink] = None) -> None:
@@ -240,12 +245,25 @@ class TriggerDispatcher:
         self._emit_payload(map_approval(**kwargs))
         return None
 
-    # -- loopback WS events ----------------------------------------------
+    # -- turn-complete hook ----------------------------------------------
 
-    def handle_ws_event(self, frame: Dict[str, Any]) -> None:
-        """Feed one ``/api/ws`` event frame through the mapper → sink.
+    def on_post_llm_call(self, **kwargs: Any) -> None:
+        """``post_llm_call`` hook callback (observer; returns None).
 
-        Called by the (optional, guarded) loopback client for each event it
-        reads. complete / error / clarify map; everything else is ignored.
+        Maps a successful turn to a generic ``complete`` payload and feeds the
+        sink. Reads only ``session_id`` — never the message content kwargs.
         """
-        self._emit_payload(map_ws_event(frame))
+        self._emit_payload(map_complete(**kwargs))
+        return None
+
+    # -- session-end (error) hook ----------------------------------------
+
+    def on_session_end(self, **kwargs: Any) -> None:
+        """``on_session_end`` hook callback (observer; returns None).
+
+        Maps a genuine turn failure to an ``error`` payload and feeds the sink
+        (success / interrupt produce nothing). The plugin separately clears the
+        policy's turn-start anchor here (see ``__init__``).
+        """
+        self._emit_payload(map_session_end(**kwargs))
+        return None

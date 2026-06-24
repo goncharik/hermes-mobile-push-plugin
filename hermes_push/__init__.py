@@ -4,31 +4,45 @@ Standalone, pip-installable Hermes Agent plugin. Uses the *public* plugin API
 only (entry-point group ``hermes_agent.plugins`` → ``register(ctx)``); it makes
 no changes to hermes-agent itself.
 
-Architecture (see docs/plans/2026-06-20-push-notifications.md in the
-hermes-mobile repo):
+Triggers (all via REAL plugin hooks — see hermes-agent ``VALID_HOOKS`` in
+``hermes_cli/plugins.py`` and the dispatch sites in
+``agent/conversation_loop.py`` / ``tools/approval.py``)
+-------------------------------------------------------------------------------
+* **approval** — ``pre_approval_request`` (observer). Fires for CLI prompts and
+  gateway/remote approvals; we push only for the gateway surface.
+* **complete** — ``post_llm_call`` (observer). Fires once per *successful* turn,
+  after the tool-loop finishes and a final assistant response is produced, in
+  BOTH CLI and gateway. We build a generic ``complete`` payload (NO message
+  content) and run it through the suppression policy (duration gate, dedup).
+* **error** — ``on_session_end`` (observer). Fires at the end of EVERY
+  ``run_conversation()`` call. We push an ``error`` only on a genuine failure
+  (``completed is False AND interrupted is False``) — success is already covered
+  by ``post_llm_call`` and interrupts are user-initiated.
+* **turn-start** — ``pre_llm_call`` (observer). Fires once per turn *before* the
+  tool-loop, in BOTH CLI and gateway, with ``session_id == agent.session_id``
+  (the same key ``post_llm_call`` / ``on_session_end`` use). We record it as the
+  policy's turn-start anchor so the complete-push duration gate can measure
+  elapsed time. Cleared at ``on_session_end``. (If a turn somehow has no
+  recorded start, the policy fails OPEN and notifies.)
 
-* This plugin runs on the user's own agent. It registers lifecycle hooks that
-  fire when the agent needs the user (approval requests) and — for the events
-  that have no hook (turn complete, error, clarify) — a best-effort, guarded,
-  off-thread loopback ``/api/ws`` connector. A REST route (``api.py``) lets the
-  iOS app register its APNs device token.
-* When a trigger fires it builds a generic ``{type, session_id, title, body}``
-  payload (no message content), runs it through the suppression policy
-  (``policy.py``), and — if it should send — POSTs it (signed, per device) to a
-  tiny stateless push gateway the *publisher* operates (the only place the APNs
-  ``.p8`` key lives). The gateway forwards to APNs.
+``clarify`` / input-needed is **NOT currently supported**: the agent emits it
+straight to the per-session WebSocket transport and exposes no registerable
+plugin hook for it.
 
 Pipeline (wired in :func:`register`)
 ------------------------------------
-    trigger (approval hook / loopback WS)
-        → TriggerDispatcher.make_payload (generic, content-free)
-        → SuppressionPolicy.decide  (no-devices / live-client / duration / dedup)
-        → GatewaySender.send        (per-device HMAC, off-thread POST, 410→prune)
+    trigger hook
+        → TriggerDispatcher.map_*  (generic, content-free payload)
+        → SuppressionPolicy.decide (no-devices / live-client / duration / dedup)
+        → GatewaySender.send       (per-device HMAC, off-thread POST, 410→prune)
 
 Robustness
 ----------
-``register()`` wraps the sender / policy / WS setup so a failure there can never
-break plugin load — the worst case is "no pushes", never "agent won't start".
+Hooks are observer-style: every handler returns ``None`` and is wrapped so it can
+never raise into the agent (the host also wraps callbacks). Pushing stays OFF the
+turn's critical path — ``GatewaySender.send`` is fire-and-forget.
+``register()`` wraps the sender / policy setup so a failure there can never break
+plugin load — the worst case is "no pushes", never "agent won't start".
 """
 
 from __future__ import annotations
@@ -41,30 +55,29 @@ from hermes_push.policy import SuppressionPolicy
 from hermes_push.sender import GatewaySender
 from hermes_push.store import TokenStore
 from hermes_push.triggers import TriggerDispatcher
-from hermes_push.wsclient import LoopbackWsConnector
 
 logger = logging.getLogger(__name__)
 
 # Lifecycle hooks this plugin observes. Names must match hermes-agent's
 # ``VALID_HOOKS`` (hermes_cli/plugins.py).
 #
-# * pre_approval_request   — approval needed. Observer-only hook; the ONLY one of
-#                            the four triggers that has a real hook path. Honors
-#                            ``surface`` (gateway → push, cli → skip).
-# * pre_gateway_dispatch   — observer over *incoming* user messages only. It does
-#                            NOT see outbound events, so turn-complete / error /
-#                            clarify do NOT arrive here. Kept as a strict no-op
-#                            observer.
-# * on_session_end         — turn finished; a cheap completion signal we use to
-#                            clear the policy's per-session turn-start anchor.
+# * pre_approval_request — approval needed. Observer hook; honors ``surface``
+#                          (gateway → push, cli → skip).
+# * pre_llm_call         — turn START. Observer hook; we record the policy's
+#                          turn-start anchor and inject NO context (return None).
+# * post_llm_call        — turn COMPLETE (success). Observer hook → ``complete``.
+# * on_session_end       — turn ENDED. Observer hook → ``error`` on genuine
+#                          failure; always clears the turn-start anchor.
 _TRIGGER_HOOKS = (
     "pre_approval_request",
-    "pre_gateway_dispatch",
+    "pre_llm_call",
+    "post_llm_call",
     "on_session_end",
 )
 
-# The shared dispatcher: owns the push sink and maps surfaced events → generic
-# payloads. Its sink is set in :func:`register` to the policy+sender pipeline.
+# The shared dispatcher: owns the push sink and maps surfaced hook events →
+# generic payloads. Its sink is set in :func:`register` to the policy+sender
+# pipeline.
 dispatcher = TriggerDispatcher()
 
 # Wired in :func:`register`; module-level so hook handlers and tests can reach
@@ -72,7 +85,6 @@ dispatcher = TriggerDispatcher()
 _store: Optional[TokenStore] = None
 _policy: Optional[SuppressionPolicy] = None
 _sender: Optional[GatewaySender] = None
-_ws_connector: Optional[LoopbackWsConnector] = None
 
 
 # ---------------------------------------------------------------------------
@@ -85,30 +97,46 @@ _ws_connector: Optional[LoopbackWsConnector] = None
 # no-op-safe so a half-finished install can never disrupt a turn.
 
 
-def _on_pre_gateway_dispatch(**_: Any) -> Optional[Dict[str, str]]:
-    """Gateway pre-dispatch. Observer-only — must NOT influence flow.
+def _on_pre_llm_call(**kwargs: Any) -> None:
+    """Turn START — record the policy's turn-start anchor for the session.
 
-    Returning ``None`` (never an ``{"action": ...}`` dict) guarantees the plugin
-    can never skip/rewrite a user message. This hook only sees *incoming* user
-    messages; the turn-complete / error / clarify triggers do NOT pass through
-    here (they go through the loopback WS connector).
-    """
-    return None
+    Returns ``None`` so we inject no context into the user message (observer
+    only). Best-effort + no-op-safe.
 
-
-def _on_session_end(**kwargs: Any) -> None:
-    """Session/turn ended — clear the policy's turn-start anchor for the session.
-
-    Best-effort + no-op-safe: a missing policy or unknown session is fine.
+    CLI caveat: this fires in both CLI and gateway, so the duration gate works in
+    both. Should a turn ever lack a recorded start, the policy fails OPEN.
     """
     if _policy is None:
         return None
     sid = kwargs.get("session_id") or kwargs.get("session_key")
     if sid:
         try:
-            _policy.clear_turn_start(str(sid))
+            _policy.note_turn_start(str(sid))
         except Exception as exc:  # pragma: no cover — never reach the host
-            logger.debug("hermes-push: clear_turn_start failed: %s", exc)
+            logger.debug("hermes-push: note_turn_start failed: %s", exc)
+    return None
+
+
+def _on_session_end(**kwargs: Any) -> None:
+    """Turn ENDED — emit an ``error`` push on genuine failure, then clear anchor.
+
+    The error-vs-skip decision (only when ``completed is False AND interrupted is
+    False``) lives in ``TriggerDispatcher.on_session_end`` / ``map_session_end``.
+    We always clear the per-session turn-start anchor afterwards. Best-effort +
+    no-op-safe.
+    """
+    try:
+        dispatcher.on_session_end(**kwargs)
+    except Exception as exc:  # pragma: no cover — dispatcher already swallows
+        logger.debug("hermes-push: on_session_end dispatch failed: %s", exc)
+
+    if _policy is not None:
+        sid = kwargs.get("session_id") or kwargs.get("session_key")
+        if sid:
+            try:
+                _policy.clear_turn_start(str(sid))
+            except Exception as exc:  # pragma: no cover — never reach the host
+                logger.debug("hermes-push: clear_turn_start failed: %s", exc)
     return None
 
 
@@ -138,18 +166,19 @@ def _pipeline(payload: Dict[str, str]) -> None:
 
 _HOOK_HANDLERS = {
     "pre_approval_request": dispatcher.on_pre_approval_request,
-    "pre_gateway_dispatch": _on_pre_gateway_dispatch,
+    "pre_llm_call": _on_pre_llm_call,
+    "post_llm_call": dispatcher.on_post_llm_call,
     "on_session_end": _on_session_end,
 }
 
 
 def _wire_pipeline(ctx: Any) -> None:
-    """Construct store/policy/sender, connect the pipeline, start the WS reader.
+    """Construct store/policy/sender and connect the pipeline.
 
     Isolated so :func:`register` can wrap it: any failure here is logged and the
     plugin still loads (hooks are registered separately and unconditionally).
     """
-    global _store, _policy, _sender, _ws_connector
+    global _store, _policy, _sender
 
     _store = TokenStore()
     # The PluginContext the host hands us does NOT expose the running gateway /
@@ -174,24 +203,12 @@ def _wire_pipeline(ctx: Any) -> None:
     # The dispatcher hands every mapped payload to the policy+sender pipeline.
     dispatcher.set_sink(_pipeline)
 
-    # Best-effort loopback WS connector for complete/error/clarify (see
-    # wsclient.py for the architectural limitation — these events are
-    # transport-scoped in hermes-agent today, so this observes nothing for other
-    # sessions until the agent grows a global event broadcast; it never blocks or
-    # breaks the plugin).
-    _ws_connector = LoopbackWsConnector(
-        on_frame=dispatcher.handle_ws_event,
-        on_turn_start=_policy.note_turn_start,
-        on_turn_end=_policy.clear_turn_start,
-    )
-    _ws_connector.start()
-
 
 def register(ctx) -> None:
     """Wire the plugin into the Hermes Agent host.
 
-    Called once at plugin load with a ``PluginContext``. Registers trigger hooks
-    and stands up the policy/sender/WS pipeline. The REST router is mounted
+    Called once at plugin load with a ``PluginContext``. Registers the trigger
+    hooks and stands up the policy/sender pipeline. The REST router is mounted
     separately by the dashboard plugin system via ``dashboard/manifest.json``
     (``api`` field) — not through ``ctx``.
     """

@@ -22,11 +22,12 @@ Gates (evaluated cheap-first so we bail out as early as possible):
    in-app WebSocket already delivers the event; a push would just buzz a phone
    that's already showing the content.
 
-3. **Duration gate (complete / error only).** Turn-complete and error pushes
-   additionally require the turn to have run longer than a threshold
-   (default 10s). A turn that finishes near-instantly didn't keep the user
-   waiting, so a "done" buzz is noise. ``approval`` and ``clarify`` always need
-   the user's attention and are **never** duration-gated.
+3. **Duration gate (complete only).** Turn-complete pushes additionally require
+   the turn to have run longer than a threshold (default 10s). A turn that
+   finishes near-instantly didn't keep the user waiting, so a "done" buzz is
+   noise. ``approval`` / ``clarify`` always need the user's attention and a real
+   ``error`` is worth surfacing even on a short turn, so those are **never**
+   duration-gated.
 
 4. **Dedup.** Collapse rapid repeats of the same ``(session_id, type)`` within
    a short window (default 5s) — e.g. an error storm. The APNs ``collapse-id``
@@ -48,7 +49,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
 
-from hermes_push.triggers import TYPE_COMPLETE, TYPE_ERROR
+from hermes_push.triggers import TYPE_COMPLETE
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,12 @@ DeviceCount = Callable[[], int]
 DEFAULT_DURATION_THRESHOLD_S = 10.0
 DEFAULT_DEDUP_WINDOW_S = 5.0
 
-# The payload types that are duration-gated. Approval / clarify always need the
-# user, so they are deliberately excluded.
-_DURATION_GATED_TYPES = frozenset({TYPE_COMPLETE, TYPE_ERROR})
+# The payload types that are duration-gated. Only ``complete`` is gated: a turn
+# that finished near-instantly didn't keep the user waiting, so a "done" buzz is
+# noise. ``approval`` / ``clarify`` always need the user's attention, and a real
+# ``error`` is worth surfacing even on a short turn — so all three are excluded
+# (dedup still collapses error storms).
+_DURATION_GATED_TYPES = frozenset({TYPE_COMPLETE})
 
 
 @dataclass(frozen=True)
