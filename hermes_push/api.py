@@ -7,9 +7,9 @@ via ``dashboard/plugin_api.py``).
 Routes
 ------
 * ``POST /register``   ``{device_token, apns_env, app_version}`` → upsert into
-  the token store. The app does not sign pushes; the plugin signs each push with
-  a single shared HMAC secret (``HERMES_PUSH_HMAC_SECRET``, see ``sender.py``), so
-  no per-device secret is minted or returned here.
+  the token store. The app holds no secret and does not sign pushes; the gateway
+  issues a device-scoped capability that the sender fetches and caches (see
+  ``sender.py``), so no secret is minted or returned here.
 * ``POST /unregister`` ``{device_token}`` → remove the token from the store.
 
 Auth (host behaviour, confirmed against hermes-agent in B1 + re-verified in B2)
@@ -26,11 +26,11 @@ We therefore do NOT re-implement auth here; doing so would double-gate and
 break the token-mode byte-compat path. (If a future host change moves plugin
 routes out from under that middleware, enforce the header in these handlers.)
 
-HMAC signing
-------------
-Pushes are signed with a single **shared** secret (``HERMES_PUSH_HMAC_SECRET``,
-the same value the gateway is configured with), applied by the sender — see
-``sender.py``. The app never signs, so registration neither mints nor returns
+Push authorization
+------------------
+The plugin holds **no shared secret**. The gateway issues a device-scoped
+**capability** that the sender fetches and presents on each push (see
+``sender.py``). The app never signs, so registration neither mints nor returns
 any secret.
 """
 
@@ -122,9 +122,9 @@ class UnregisterResponse(BaseModel):
 def register(req: RegisterRequest) -> RegisterResponse:
     """Register (or refresh) an APNs device token.
 
-    No secret is minted or returned — the plugin signs pushes with a single
-    shared HMAC secret (see ``sender.py``), so the app stores nothing beyond the
-    device token it already has.
+    No secret is minted or returned — the gateway issues a device-scoped
+    capability that the sender fetches and caches (see ``sender.py``), so the app
+    stores nothing beyond the device token it already has.
     """
     store = get_store()
     record = store.upsert(
@@ -158,8 +158,8 @@ def send_test(req: Optional[dict] = None) -> TestPushResponse:
 
     Backs the iOS Settings "Send test notification" button (C6): looks up the
     registered devices and fans a generic ``complete``-type sample payload out
-    through the same :class:`GatewaySender` pipeline real triggers use (per-device
-    HMAC, off-thread POST, 410→prune). It intentionally **bypasses the
+    through the same :class:`GatewaySender` pipeline real triggers use (gateway
+    capability, off-thread POST, 410→prune). It intentionally **bypasses the
     suppression policy** — a test push is an explicit user action that should
     always go out, regardless of live-client / duration / dedup gates.
 

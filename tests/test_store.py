@@ -31,8 +31,10 @@ def test_upsert_new_token_persists_full_record(store):
     assert rec["device_token"] == "tok-1"
     assert rec["apns_env"] == "sandbox"
     assert rec["app_version"] == "1.0.0"
-    # No secret material is stored — the plugin signs with a shared env secret.
+    # No secret material is stored — the gateway issues a device-scoped capability.
     assert "hmac_secret" not in rec
+    # A fresh record has no capability until the sender fetches one.
+    assert "capability" not in rec
     assert rec["created_at"]
     assert rec["updated_at"]
 
@@ -52,6 +54,45 @@ def test_upsert_existing_token_updates_env_version_and_keeps_created(store):
     # created_at preserved; updated_at present.
     assert second["created_at"] == first["created_at"]
     assert second["updated_at"]
+
+
+# ---------------------------------------------------------------------------
+# Gateway-issued capability caching
+# ---------------------------------------------------------------------------
+
+
+def test_set_capability_updates_existing_token(store):
+    _upsert(store, token="tok-1")
+    assert store.set_capability("tok-1", "cap-abc") is True
+    assert store.get("tok-1")["capability"] == "cap-abc"
+    # Survives a fresh store instance reading the same file.
+    reloaded = TokenStore(base_dir=store.path.parent).get("tok-1")
+    assert reloaded["capability"] == "cap-abc"
+
+
+def test_set_capability_unknown_token_returns_false_and_creates_nothing(store):
+    assert store.set_capability("ghost", "cap-x") is False
+    assert store.get("ghost") is None
+
+
+def test_set_capability_can_clear(store):
+    _upsert(store, token="tok-1")
+    store.set_capability("tok-1", "cap-abc")
+    assert store.set_capability("tok-1", "") is True
+    assert store.get("tok-1")["capability"] == ""
+
+
+def test_upsert_preserves_existing_capability_on_update(store):
+    _upsert(store, token="tok-1", env="sandbox", version="1.0.0")
+    store.set_capability("tok-1", "cap-keep")
+
+    # An env/version refresh (e.g. app update) must NOT wipe the capability —
+    # it is bound to the device_token, which is unchanged.
+    updated = _upsert(store, token="tok-1", env="production", version="2.0.0")
+    assert updated["apns_env"] == "production"
+    assert updated["app_version"] == "2.0.0"
+    assert updated["capability"] == "cap-keep"
+    assert store.get("tok-1")["capability"] == "cap-keep"
 
 
 def test_get_missing_returns_none(store):

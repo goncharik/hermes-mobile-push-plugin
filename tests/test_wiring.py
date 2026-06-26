@@ -80,20 +80,24 @@ def test_pipeline_noop_when_unwired(monkeypatch):
 
 
 class _RecordingHttp:
-    """Captures the JSON request bodies posted to the gateway (no socket)."""
+    """Captures the gateway request bodies (no socket).
+
+    Answers the ``/register`` round-trip with a capability so the sender can
+    proceed to the push, and records the PUSH bodies in ``bodies``.
+    """
 
     def __init__(self) -> None:
         self.bodies: List[dict] = []
 
     def post_json(self, url: str, body: bytes, *, timeout: float) -> HttpResponse:
+        if url.endswith("/register"):
+            return HttpResponse(status=200, body=json.dumps({"capability": "cap-test"}))
         self.bodies.append(json.loads(body.decode("utf-8")))
         return HttpResponse(status=200, body="")
 
 
 def _wire_real_pipeline(monkeypatch, tmp_path, *, http):
     """Stand up a real store+policy+sender pipeline bound to the dispatcher."""
-    # Provision the shared HMAC secret so the sender signs (matching the gateway).
-    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
     store = TokenStore(base_dir=tmp_path)
     store.upsert(device_token="dt", apns_env="production", app_version="1")
     policy = SuppressionPolicy(
@@ -127,7 +131,8 @@ def test_approval_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
     req = http.bodies[-1]
     assert req["type"] == "approval"
     assert req["session_id"] == "sess-approval"
-    assert "hmac" in req  # signed with the shared secret
+    assert req["capability"] == "cap-test"  # gateway-issued, not a shared secret
+    assert "hmac" not in req
 
 
 def test_complete_trigger_delivers_through_pipeline(monkeypatch, tmp_path):
@@ -261,7 +266,6 @@ def test_register_survives_pipeline_failure(monkeypatch):
 def test_pre_llm_call_records_turn_start_then_gate(monkeypatch, tmp_path):
     """pre_llm_call notes the anchor; a short turn's complete push is gated."""
     http = _RecordingHttp()
-    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
     store = TokenStore(base_dir=tmp_path)
     store.upsert(device_token="dt", apns_env="production", app_version="1")
 
@@ -314,7 +318,6 @@ def test_on_session_end_clears_turn_start(monkeypatch, tmp_path):
 
 def _wire_clarify_suppression(monkeypatch, tmp_path):
     """A real pipeline + a controllable clock, bound to the dispatcher."""
-    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
     store = TokenStore(base_dir=tmp_path)
     store.upsert(device_token="dt", apns_env="production", app_version="1")
 
@@ -385,7 +388,6 @@ def test_clarify_flag_resets_per_turn(monkeypatch, tmp_path):
 
 def test_suppressed_clarify_does_not_suppress_complete(monkeypatch, tmp_path):
     """A clarify dropped by the policy (no devices) must NOT suppress complete."""
-    monkeypatch.setenv("HERMES_PUSH_HMAC_SECRET", "shared-secret-for-tests")
     store = TokenStore(base_dir=tmp_path)  # no devices registered
     fake_now = {"t": 0.0}
     policy = SuppressionPolicy(

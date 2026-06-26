@@ -36,7 +36,7 @@ Pipeline (wired in :func:`register`)
     trigger hook
         → TriggerDispatcher.map_*  (generic, content-free payload)
         → SuppressionPolicy.decide (no-devices / live-client / duration / dedup)
-        → GatewaySender.send       (per-device HMAC, off-thread POST, 410→prune)
+        → GatewaySender.send       (gateway capability, off-thread POST, 410→prune)
 
 Robustness
 ----------

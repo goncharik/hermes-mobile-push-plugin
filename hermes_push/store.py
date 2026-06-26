@@ -18,9 +18,10 @@ Design notes:
   read-modify-write cycle. The agent touches this from a couple of hook /
   request threads, not a high-fanout hot path.
 
-HMAC signing uses a single **shared** secret (``HERMES_PUSH_HMAC_SECRET``, the
-same value the gateway is configured with), applied by the sender — NOT a
-per-device secret. The store therefore keeps no secret material.
+The plugin holds **no shared secret**. The gateway issues a device-scoped
+**capability** (an opaque hex string) that the sender fetches per device; the
+store caches it on the device record (the optional ``capability`` field) so it is
+presented on each push and reused across ``apns_env`` / ``app_version`` refreshes.
 """
 
 from __future__ import annotations
@@ -141,7 +142,10 @@ class TokenStore:
         """Insert or update a device token; return the stored record.
 
         ``created_at`` is preserved on update; only ``updated_at`` (and the
-        env / version) change.
+        env / version) change. An existing ``capability`` is PRESERVED — it is
+        bound to the ``device_token`` (the key), so it stays valid across
+        ``apns_env`` / ``app_version`` refreshes. New records carry no capability
+        until the sender fetches one from the gateway.
         """
         with self._lock:
             data = self._read()
@@ -156,6 +160,7 @@ class TokenStore:
                     "updated_at": now,
                 }
             else:
+                # dict(existing) carries forward any cached "capability".
                 record = dict(existing)
                 record["device_token"] = device_token
                 record["apns_env"] = apns_env
@@ -165,6 +170,24 @@ class TokenStore:
             data[device_token] = record
             self._write(data)
             return dict(record)
+
+    def set_capability(self, device_token: str, capability: str) -> bool:
+        """Cache the gateway-issued ``capability`` for a device token.
+
+        Returns ``True`` if the token existed and was updated, ``False`` if it is
+        unknown (no record is created). Pass an empty string to clear a stale
+        capability (e.g. after the gateway rejects it with a 403).
+        """
+        with self._lock:
+            data = self._read()
+            record = data.get(device_token)
+            if record is None:
+                return False
+            record["capability"] = capability
+            record["updated_at"] = _now_iso()
+            data[device_token] = record
+            self._write(data)
+            return True
 
     def get(self, device_token: str) -> Optional[Dict[str, Any]]:
         """Return the record for ``device_token`` or ``None``."""

@@ -57,6 +57,17 @@ hermes-agent.
 Privacy: only a generic title/body + `session_id` transit the gateway; real
 message content is fetched in-app over the user's private network.
 
+### Push authorization
+
+The plugin holds **no shared secret**. Instead the gateway issues a
+**device-scoped capability** (an opaque string) that the plugin fetches once per
+device, caches in its token store, and presents on every push. On a device's
+first push the plugin `POST`s `{"device_token": …}` to the gateway's `/register`
+endpoint and stores the returned `{"capability": …}`; subsequent pushes reuse it.
+If the gateway rejects a push with `403` (stale/rotated capability) the plugin
+drops the cached value, re-registers once, and retries the push. The plugin never
+computes the capability itself — it is opaque.
+
 ## Install
 
 ```bash
@@ -96,8 +107,8 @@ Feature-complete and tested. Implemented: the JSON-file token store, the
 trigger→payload mappers (the `pre_approval_request` / `pre_tool_call` /
 `post_llm_call` / `on_session_end` hooks), the suppression policy
 (client-present / duration / dedup / no-devices gates), and the outbound
-`GatewaySender` (off-thread fan-out, bounded retries, shared-secret HMAC,
-HTTP-410 prune). Plus a `POST /api/plugins/hermes-push/test` route that fans a
+`GatewaySender` (off-thread fan-out, bounded retries, gateway-issued device
+capability, HTTP-410 prune). Plus a `POST /api/plugins/hermes-push/test` route that fans a
 sample push through the real pipeline (backs the iOS Settings "Send test
 notification"). All four triggers — approval / turn-complete / error / clarify —
 are supported.
@@ -106,8 +117,11 @@ are supported.
 
 | Env var                   | What it is                                                              |
 | ------------------------- | ---------------------------------------------------------------------- |
-| `HERMES_PUSH_GATEWAY_URL` | Override the push-gateway URL (defaults to the `GATEWAY_URL` const in `sender.py`; set it to your deployed Worker's `…/push` after deploy). |
-| `HERMES_PUSH_HMAC_SECRET` | **Shared** HMAC secret. Provision the SAME value to the gateway (its `HMAC_SECRET`). The plugin signs every push with it; if unset, pushes are sent **unsigned** (the gateway allows unsigned) and a one-time warning is logged. |
+| `HERMES_PUSH_GATEWAY_URL` | Override the push-gateway URL (defaults to the `GATEWAY_URL` const in `sender.py`; set it to your deployed Worker's `…/push` after deploy). The `/register` URL is derived from it (`…/push` → `…/register`). |
+
+The plugin holds **no shared secret** — push authorization uses a device-scoped
+capability the gateway issues and the plugin caches (see *Push authorization*
+above).
 
 ## Routes
 
