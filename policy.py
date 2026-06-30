@@ -49,7 +49,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
 
-from hermes_push.triggers import TYPE_COMPLETE
+from .triggers import TYPE_COMPLETE
 
 logger = logging.getLogger(__name__)
 

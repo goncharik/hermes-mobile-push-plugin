@@ -1,9 +1,16 @@
 # hermes-push
 
-A **standalone, pip-installable** [Hermes Agent](https://github.com/) plugin that
-delivers push notifications to the **Hermes Mobile** iOS app when a turn finishes
-or fails, or the agent needs the user — even while the app is backgrounded and
-its WebSocket has dropped.
+A **standalone, directory-installed** [Hermes Agent](https://github.com/) plugin
+that delivers push notifications to the **Hermes Mobile** iOS app when a turn
+finishes or fails, or the agent needs the user — even while the app is
+backgrounded and its WebSocket has dropped.
+
+> **Install it as a directory clone** into `~/.hermes/plugins/hermes-push/` (see
+> [Install](#install)). That is the only layout the agent loads **both** the
+> trigger hooks **and** the `POST /api/plugins/hermes-push/register` route from —
+> the agent mounts a plugin's HTTP routes only from a directory plugin's
+> `dashboard/manifest.json`, never from a pip-installed package. (`pip install`
+> still works, but loads the **hooks only** — no route.)
 
 ## Triggers
 
@@ -28,13 +35,9 @@ each other and with the approval hook's `session_key` and `pre_tool_call`'s
 > `question` / `choices`) — the plugin reads ONLY `session_id` from them. No
 > content ever leaves the plugin.
 
-It uses only Hermes Agent's **public plugin API** (entry-point group
-`hermes_agent.plugins`, `register(ctx)`). It makes **no changes** to
-hermes-agent.
-
-> This directory is kept **local** to the `hermes-mobile` repo (gitignored) and
-> is **not** pushed. It is published separately (PyPI / install-from-source) so
-> self-hosters can `pip install hermes-push` and restart their agent.
+It uses only Hermes Agent's **public plugin API** (the `register(ctx)` hooks and
+the dashboard plugin system's `dashboard/manifest.json`). It makes **no changes**
+to hermes-agent.
 
 ## Architecture
 
@@ -70,33 +73,77 @@ computes the capability itself — it is opaque.
 
 ## Install
 
+Install as a **directory plugin** — clone the repo straight into the agent's
+user-plugins directory:
+
 ```bash
-pip install hermes-push        # or: pip install -e .  from this directory
+git clone https://github.com/goncharik/hermes-mobile-push-plugin.git \
+  ~/.hermes/plugins/hermes-push
+
+# Ensure the one runtime dep is in the agent's Python environment.
+# (FastAPI is already present because the agent runs the dashboard; install it
+# only if your agent env somehow lacks it.)
+pip install fastapi   # usually already satisfied by hermes-agent
+
+# Enable the plugin (opt-in; installing alone does not load it):
 hermes plugins enable hermes-push
-# restart the agent
+#   …or add it by hand to ~/.hermes/config.yaml:
+#     plugins:
+#       enabled:
+#         - hermes-push
+
+# Restart the agent.
 ```
 
-The plugin is discovered via its `hermes_agent.plugins` entry point. Like all
-non-bundled plugins it is opt-in via `plugins.enabled` in Hermes config.
+This is the **only** install that loads both halves of the plugin:
+
+- **Trigger hooks** load via the directory loader, which imports
+  `~/.hermes/plugins/hermes-push/__init__.py` (its `register(ctx)`).
+- **The `POST /api/plugins/hermes-push/register` route** is mounted by the
+  agent's dashboard plugin system, which scans
+  `~/.hermes/plugins/hermes-push/dashboard/manifest.json` — a **directory-only**
+  scan. pip/entry-point packages are never scanned for dashboard routes.
+
+The routes mount under `/api/plugins/hermes-push/` (`/register`, `/unregister`,
+`/test`).
+
+> **pip install loads the hooks only.** `pip install hermes-push` (or
+> `pip install -e .` from a clone) still works via the `hermes_agent.plugins`
+> entry point and registers the trigger hooks, but the agent will **not** mount
+> the `/register` route from a pip package — the iOS app would have nowhere to
+> register its device token. Use the directory clone above for the full plugin.
+
+Like all non-bundled plugins it is opt-in via `plugins.enabled` in Hermes config.
 
 ## Layout
 
+The repo root **is** the `hermes_push` package (flat layout) so the agent's
+directory loader can import `__init__.py` directly. Internal imports are
+relative.
+
 | Path | Purpose |
 |---|---|
-| `hermes_push/__init__.py` | `register(ctx)` — wires trigger hooks |
-| `hermes_push/api.py` | FastAPI `router` (`/register`, `/unregister`) |
+| `__init__.py` | `register(ctx)` — wires the trigger hooks (the directory loader's entry) |
+| `api.py` | FastAPI `router` (`/register`, `/unregister`, `/test`) — used by the hooks + pip path |
+| `policy.py` / `sender.py` / `store.py` / `triggers.py` | suppression policy, gateway sender, token store, trigger→payload mappers |
 | `plugin.yaml` | plugin manifest (name, version, hooks) |
 | `dashboard/manifest.json` | declares the `api` router file for the dashboard plugin system |
-| `dashboard/plugin_api.py` | thin shim re-exporting `hermes_push.api.router` (the host imports the `api` file from inside `dashboard/`) |
-| `tests/` | `pytest` suite |
+| `dashboard/plugin_api.py` | **self-contained** standalone router (the host imports it by path, outside the package). Loads `store.py`/`triggers.py`/`sender.py` by file path and reaches shared state via the on-disk token store — it does **not** import the `hermes_push` package |
+| `tests/` | `pytest` suite (`tests/pytest.ini` pins rootdir to `tests/`) |
 
 ## Development
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[test]"
-python -m pytest
+pytest tests/          # or: make test
 ```
+
+Run the suite with **`pytest tests/`** (or `make test`). The repo root is the
+`hermes_push` package, so `tests/pytest.ini` pins pytest's rootdir to `tests/`
+(otherwise pytest would treat the repo root as a package and fail importing its
+`__init__.py` standalone). `tests/conftest.py` registers `hermes_push` the same
+way the agent's directory loader does.
 
 Tests mock the Hermes `PluginContext`, so the suite runs standalone without
 hermes-agent installed.

@@ -42,8 +42,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from hermes_push.store import TokenStore
-from hermes_push.triggers import make_payload
+from .store import TokenStore
+from .triggers import make_payload
 
 # The web server imports this module and looks for a module-level ``router``
 # attribute (hermes_cli/web_server.py::_mount_plugin_api_routes).

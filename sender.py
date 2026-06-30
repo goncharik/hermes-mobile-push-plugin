@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
-from hermes_push.store import TokenStore
+from .store import TokenStore
 
 logger = logging.getLogger(__name__)
 

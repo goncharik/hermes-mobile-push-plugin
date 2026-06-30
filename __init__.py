@@ -52,11 +52,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from hermes_push import api
-from hermes_push.policy import SuppressionPolicy
-from hermes_push.sender import GatewaySender
-from hermes_push.store import TokenStore
-from hermes_push.triggers import TYPE_CLARIFY, TYPE_COMPLETE, TriggerDispatcher
+from . import api
+from .policy import SuppressionPolicy
+from .sender import GatewaySender
+from .store import TokenStore
+from .triggers import TYPE_CLARIFY, TYPE_COMPLETE, TriggerDispatcher
 
 logger = logging.getLogger(__name__)
 

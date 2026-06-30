@@ -24,11 +24,30 @@ test = [
 # calls ``ep.load()`` which resolves the ``module:attr`` reference below, then
 # calls ``register(ctx)`` on it. See hermes_cli/plugins.py (_scan_entry_points,
 # _load_entrypoint_module).
+#
+# NOTE: the SUPPORTED install is a directory clone into
+# ``~/.hermes/plugins/hermes-push/`` (loads BOTH the hooks AND the /register
+# route — see README). pip install is a secondary convenience that loads the
+# HOOKS ONLY (the dashboard /register route is mounted exclusively from the
+# directory layout's ``dashboard/manifest.json``, never from pip packages).
 [project.entry-points."hermes_agent.plugins"]
 hermes-push = "hermes_push:register"
 
+# The repo root IS the ``hermes_push`` package (flat layout, so the directory
+# loader can import the root ``__init__.py`` directly). ``package_dir`` maps the
+# importable name to ``.`` so pip can still install it under that name.
 [tool.setuptools]
 packages = ["hermes_push"]
+package-dir = { "hermes_push" = "." }
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.setuptools.package-data]
+hermes_push = ["plugin.yaml", "dashboard/manifest.json"]
+
+# NOTE: pytest configuration lives in ``tests/pytest.ini``, NOT here, on
+# purpose. The repo root is the ``hermes_push`` package (flat directory-plugin
+# layout): its ``__init__.py`` sits at the repo root so the Hermes agent's
+# directory loader can import it. If pytest's rootdir were the repo root, pytest
+# would treat the root as a Package collector node and import that ``__init__.py``
+# standalone — which fails on its relative imports. Pinning the ini under
+# ``tests/`` makes rootdir ``tests/`` so the package source is never walked as a
+# test package. Run the suite with ``pytest tests/`` (or ``make test``).
