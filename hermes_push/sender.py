@@ -57,11 +57,10 @@ logger = logging.getLogger(__name__)
 # Gateway URL
 # ---------------------------------------------------------------------------
 #
-# Baked-in default. The publisher REPLACES this with the deployed gateway URL
-# post-deploy (see the plan's Post-Completion / gateway deployment step). An env
-# override (``HERMES_PUSH_GATEWAY_URL``) is honored so the URL can be pointed at
-# a local mock / staging gateway for testing without editing source.
-_DEFAULT_GATEWAY_URL = "https://hermes-push.example.workers.dev/push"
+# Baked-in default: the publisher's deployed push gateway. An env override
+# (``HERMES_PUSH_GATEWAY_URL``) is honored so the URL can be pointed at a local
+# mock / staging gateway for testing without editing source.
+_DEFAULT_GATEWAY_URL = "https://hermes-push-gateway.tulusheg.workers.dev/push"
 GATEWAY_URL = os.environ.get("HERMES_PUSH_GATEWAY_URL") or _DEFAULT_GATEWAY_URL
 
 # Delivery tunables (all overridable on the constructor).
