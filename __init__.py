@@ -56,7 +56,13 @@ from . import api
 from .policy import SuppressionPolicy
 from .sender import GatewaySender
 from .store import TokenStore
-from .triggers import TYPE_CLARIFY, TYPE_COMPLETE, TriggerDispatcher
+from .triggers import (
+    TYPE_CLARIFY,
+    TYPE_COMPLETE,
+    TriggerDispatcher,
+    clear_turn_session,
+    record_turn_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +117,19 @@ def _on_pre_llm_call(**kwargs: Any) -> None:
 
     CLI caveat: this fires in both CLI and gateway, so the duration gate works in
     both. Should a turn ever lack a recorded start, the policy fails OPEN.
+
+    Also records the turn's real ``session_id`` for the current-turn tracker so a
+    following ``pre_approval_request`` (which carries no usable id) can correlate
+    to the right chat.
     """
+    sid = kwargs.get("session_id") or kwargs.get("session_key")
+    if sid:
+        try:
+            record_turn_session(str(sid))
+        except Exception as exc:  # pragma: no cover — never reach the host
+            logger.debug("hermes-push: record_turn_session failed: %s", exc)
     if _policy is None:
         return None
-    sid = kwargs.get("session_id") or kwargs.get("session_key")
     if sid:
         try:
             _policy.note_turn_start(str(sid))
@@ -143,6 +158,13 @@ def _on_session_end(**kwargs: Any) -> None:
                 _policy.clear_turn_start(str(sid))
             except Exception as exc:  # pragma: no cover — never reach the host
                 logger.debug("hermes-push: clear_turn_start failed: %s", exc)
+
+    # Hygiene: clear the current-turn tracker so a stale id can't leak across
+    # turns. Overwriting it each turn via pre_llm_call is the primary mechanism.
+    try:
+        clear_turn_session()
+    except Exception as exc:  # pragma: no cover — never reach the host
+        logger.debug("hermes-push: clear_turn_session failed: %s", exc)
     return None
 
 

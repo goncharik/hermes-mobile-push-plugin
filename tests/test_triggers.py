@@ -22,11 +22,14 @@ from hermes_push.triggers import (
     TYPE_COMPLETE,
     TYPE_ERROR,
     TriggerDispatcher,
+    clear_turn_session,
+    current_turn_session,
     make_payload,
     map_approval,
     map_clarify,
     map_complete,
     map_session_end,
+    record_turn_session,
 )
 
 
@@ -337,6 +340,83 @@ def test_set_sink_replaces_sink() -> None:
     d.on_pre_approval_request(surface="gateway", session_key="s1")
     assert first == []
     assert len(second) == 1
+
+
+# ---------------------------------------------------------------------------
+# current-turn tracker → approval session-id correlation
+# ---------------------------------------------------------------------------
+#
+# The bug: pre_approval_request carries only a source-derived session_key that
+# diverges from agent.session_id (the id the app opens chats by). The plugin sees
+# the real session_id earlier in the same turn (pre_llm_call / pre_tool_call), so
+# the approval must correlate to that recorded id — matching complete.
+
+
+def test_record_and_read_turn_session_roundtrip() -> None:
+    assert current_turn_session() == ""
+    record_turn_session("S-live")
+    assert current_turn_session() == "S-live"
+    clear_turn_session()
+    assert current_turn_session() == ""
+
+
+def test_record_turn_session_ignores_empty() -> None:
+    record_turn_session("S1")
+    record_turn_session("")  # must not wipe a good value
+    assert current_turn_session() == "S1"
+
+
+def test_approval_uses_pre_llm_call_turn_session_over_session_key() -> None:
+    # pre_llm_call(session_id="S1"), then approval with a diverging session_key.
+    record_turn_session("S1")
+    payload = map_approval(surface="gateway", session_key="Kx")
+    assert payload is not None
+    assert payload["session_id"] == "S1"  # NOT "Kx"
+    _assert_generic_payload(payload, ptype=TYPE_APPROVAL, sid="S1")
+
+
+def test_approval_uses_pre_tool_call_turn_session_over_session_key() -> None:
+    # pre_tool_call(tool_name="something", session_id="S2") records the turn id.
+    d = TriggerDispatcher()
+    d.on_pre_tool_call(tool_name="something", args={"x": 1}, session_id="S2")
+    payload = map_approval(surface="gateway", session_key="Ky")
+    assert payload is not None
+    assert payload["session_id"] == "S2"
+
+
+def test_approval_falls_back_to_session_key_without_turn_signal() -> None:
+    # No prior turn signal, only session_key → last-resort fallback, no regression.
+    assert current_turn_session() == ""
+    payload = map_approval(surface="gateway", session_key="Kz")
+    assert payload is not None
+    assert payload["session_id"] == "Kz"
+
+
+def test_approval_prefers_explicit_session_id_over_session_key() -> None:
+    # No turn signal, but an explicit session_id kwarg beats session_key.
+    payload = map_approval(surface="gateway", session_id="Sid", session_key="Key")
+    assert payload is not None
+    assert payload["session_id"] == "Sid"
+
+
+def test_approval_still_skipped_for_cli_even_with_turn_session() -> None:
+    record_turn_session("S1")
+    assert map_approval(surface="cli", session_key="Kx") is None
+
+
+def test_approval_skipped_when_resolved_id_empty() -> None:
+    # No turn signal, no ids → nothing to push.
+    assert current_turn_session() == ""
+    assert map_approval(surface="gateway") is None
+
+
+def test_turn_tracker_does_not_leak_into_complete_or_clarify() -> None:
+    # complete / clarify keep using their own session_id, never the tracker.
+    record_turn_session("TRACKED")
+    complete = map_complete(session_id="C1")
+    assert complete is not None and complete["session_id"] == "C1"
+    clarify = map_clarify(tool_name="clarify", session_id="CL1")
+    assert clarify is not None and clarify["session_id"] == "CL1"
 
 
 # ---------------------------------------------------------------------------

@@ -19,9 +19,14 @@ How the events surface (verified against hermes-agent — see STEP 0 findings)
 ----------------------------------------------------------------------------
 * **approval** — the ``pre_approval_request`` hook (``tools/approval.py``). An
   *observer* hook fired both for CLI prompts and gateway/remote approvals,
-  exposing ``surface`` ("cli" | "gateway") and ``session_key`` (== the gateway
-  ``session_id``). We push only for gateway/remote surfaces and ignore CLI-only
-  requests.
+  exposing ``surface`` ("cli" | "gateway") and ``session_key``. NOTE:
+  ``session_key`` is a *source-derived* key that diverges from the gateway
+  ``session_id`` (== ``agent.session_id``) the iOS app opens chats by — the hook
+  carries NO ``session_id`` of its own. So we correlate the approval to the
+  current turn's real ``session_id`` recorded earlier in the same turn (via
+  ``pre_llm_call`` / ``pre_tool_call``; see :func:`current_turn_session`), and
+  only fall back to ``session_id`` / ``session_key`` if that tracker is empty. We
+  push only for gateway/remote surfaces and ignore CLI-only requests.
 
 * **complete** — the ``post_llm_call`` hook (``agent/conversation_loop.py``),
   fired once per turn after the tool-loop finishes and a final assistant
@@ -47,7 +52,9 @@ I/O so the suite can assert payloads without a running agent.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import threading
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -60,6 +67,59 @@ PushSink = Callable[[Dict[str, str]], None]
 def _noop_sink(_payload: Dict[str, str]) -> None:
     """Default sink — drops payloads. Replaced by the policy/sender in B4/B5."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# Current-turn session tracker
+# ---------------------------------------------------------------------------
+#
+# The ``pre_approval_request`` hook carries NO ``session_id`` — only a
+# source-derived ``session_key`` that diverges from the gateway
+# ``session_id`` (== ``agent.session_id``) the iOS app opens chats by. But the
+# plugin DOES see the real ``session_id`` earlier in the same turn
+# (``pre_llm_call`` / ``pre_tool_call`` both fire before an approval). We stash
+# it here so :func:`map_approval` can correlate the approval to the right chat.
+#
+# Belt-and-suspenders: we can't be sure whether the hooks run in the async
+# context or a thread-pool worker, so we record into BOTH a ``ContextVar`` and a
+# ``threading.local()`` and read the first non-empty on the way out.
+
+_turn_session_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_push_turn_session", default=""
+)
+_turn_session_local = threading.local()
+
+
+def record_turn_session(session_id: str) -> None:
+    """Record the current turn's real ``session_id`` (both contextvar + thread-local).
+
+    Called from ``pre_llm_call`` / ``pre_tool_call`` (which DO receive the real
+    ``agent.session_id``). No-op on an empty id so a stray call can't wipe a good
+    value mid-turn.
+    """
+    if not session_id:
+        return
+    sid = str(session_id)
+    _turn_session_var.set(sid)
+    _turn_session_local.session_id = sid
+
+
+def current_turn_session() -> str:
+    """Read the current turn's recorded ``session_id`` (contextvar → thread-local → "")."""
+    sid = _turn_session_var.get()
+    if sid:
+        return sid
+    return str(getattr(_turn_session_local, "session_id", "") or "")
+
+
+def clear_turn_session() -> None:
+    """Best-effort clear the turn tracker (hygiene; called on ``on_session_end``).
+
+    The primary correctness mechanism is overwriting the value each turn via
+    ``pre_llm_call``; this just avoids leaking a stale id across turns.
+    """
+    _turn_session_var.set("")
+    _turn_session_local.session_id = ""
 
 
 # ---------------------------------------------------------------------------
@@ -130,24 +190,55 @@ def make_payload(payload_type: str, session_id: str) -> Dict[str, str]:
 
 
 def _approval_session_id(kwargs: Dict[str, Any]) -> str:
-    """Pull the session id out of ``pre_approval_request`` kwargs.
+    """Resolve the session id for a ``pre_approval_request`` hook.
 
-    The gateway registers approvals under ``session_key`` which equals the
-    gateway ``session_id`` (tui_gateway/server.py register_gateway_notify is
-    called with the same key it ``_emit``\\s ``session_id`` for). We prefer
-    ``session_key`` and fall back to an explicit ``session_id`` if a future
-    host passes one.
+    ``pre_approval_request`` carries NO ``session_id`` of its own — only a
+    source-derived ``session_key`` that DIVERGES from the gateway ``session_id``
+    (== ``agent.session_id``) the iOS app opens chats by. Using ``session_key``
+    made the approval push carry the wrong id, so tapping it only landed on the
+    sessions list. We resolve in this priority, first non-empty wins:
+
+    1. :func:`current_turn_session` — the real ``session_id`` recorded earlier in
+       the same turn by ``pre_llm_call`` / ``pre_tool_call`` (matches ``complete``).
+    2. ``kwargs["session_id"]`` — in case a future host passes it directly.
+    3. ``kwargs["session_key"]`` — last-resort fallback so nothing regresses if
+       the turn tracker is somehow empty.
+
+    Logs which source supplied the id (label + the non-secret session id only) so
+    on-device misbehaviour is diagnosable from agent.log.
     """
-    sid = kwargs.get("session_key") or kwargs.get("session_id") or ""
-    return str(sid)
+    tracked = current_turn_session()
+    if tracked:
+        logger.info(
+            "hermes-push: approval session id from turn-tracker (session_id=%s)",
+            tracked,
+        )
+        return tracked
+
+    explicit = str(kwargs.get("session_id") or "")
+    if explicit:
+        logger.info(
+            "hermes-push: approval session id from session_id kwarg (session_id=%s)",
+            explicit,
+        )
+        return explicit
+
+    key = str(kwargs.get("session_key") or "")
+    if key:
+        logger.info(
+            "hermes-push: approval session id from session_key fallback (session_id=%s)",
+            key,
+        )
+    return key
 
 
 def _hook_session_id(kwargs: Dict[str, Any]) -> str:
     """Pull ``session_id`` from a ``post_llm_call`` / ``on_session_end`` hook.
 
-    Both fire with ``session_id=agent.session_id`` (the same key the gateway uses
-    for ``pre_approval_request``\\'s ``session_key`` and the WS frame, so push
-    threads collapse correctly). We read ONLY the id — never the message content.
+    Both fire with ``session_id=agent.session_id`` — the id the iOS app opens
+    chats by and the WS frame carries, so push threads collapse correctly. (This
+    is NOT the same as ``pre_approval_request``\\'s source-derived ``session_key``;
+    see :func:`_approval_session_id`.) We read ONLY the id — never message content.
     """
     sid = kwargs.get("session_id") or kwargs.get("session_key") or ""
     return str(sid)
@@ -281,7 +372,12 @@ class TriggerDispatcher:
         payload, feeding the sink. Every other tool is ignored. Reads only
         ``session_id`` — never the clarify args. Always returns ``None`` so it
         can never block the tool (we are an observer, not a gatekeeper).
+
+        Also records the turn's real ``session_id`` for the current-turn tracker
+        so a following ``pre_approval_request`` (which lacks a usable id) can
+        correlate to the right chat. This runs for EVERY tool, not just clarify.
         """
+        record_turn_session(str(kwargs.get("session_id") or ""))
         self._emit_payload(map_clarify(**kwargs))
         return None
 

@@ -20,6 +20,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PKG = "hermes_push"
 
@@ -33,3 +35,18 @@ if _PKG not in sys.modules:
     module = importlib.util.module_from_spec(spec)
     sys.modules[_PKG] = module
     spec.loader.exec_module(module)
+
+
+@pytest.fixture(autouse=True)
+def _reset_turn_session_tracker():
+    """Clear the module-level current-turn session tracker around every test.
+
+    The tracker (contextvar + thread-local) is process-global, so a value
+    recorded by one test's ``pre_llm_call`` / ``pre_tool_call`` must not leak into
+    another test's approval-mapping assertions.
+    """
+    from hermes_push import triggers
+
+    triggers.clear_turn_session()
+    yield
+    triggers.clear_turn_session()
