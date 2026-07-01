@@ -68,6 +68,12 @@ DEFAULT_TIMEOUT_S = 5.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_BASE_S = 0.5
 
+# An explicit User-Agent. The stdlib default (`Python-urllib/3.x`) is flagged by
+# Cloudflare Bot Fight Mode / WAF and rejected at the edge with a 403 *before* the
+# Worker runs — which silently breaks capability registration (curl works, urllib
+# doesn't). A descriptive UA is treated as a normal client.
+_USER_AGENT = "hermes-push-plugin/1.0 (+https://github.com/goncharik/hermes-mobile-push-plugin)"
+
 
 def _register_url_for(push_url: str) -> str:
     """Derive the gateway's ``/register`` URL from its configured ``/push`` URL.
@@ -115,7 +121,7 @@ class UrllibHttpClient:
             url,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": _USER_AGENT},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
