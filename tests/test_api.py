@@ -16,8 +16,54 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import json
+
 from hermes_push import api
+from hermes_push.sender import GatewaySender, HttpResponse
 from hermes_push.store import TokenStore
+
+
+class _FakeHttp:
+    """Routes POSTs by URL so /test can be driven without a network.
+
+    ``/register`` returns a scripted capability (or raises to simulate a failed
+    capability fetch); ``/push`` returns a scripted status.
+    """
+
+    def __init__(self, *, register=None, push=None, capability="cap-test"):
+        self._register = list(register or [])
+        self._push = list(push or [])
+        self._capability = capability
+        self.register_calls = []
+        self.push_calls = []
+
+    def post_json(self, url, body, *, timeout):
+        parsed = json.loads(body.decode("utf-8"))
+        if url.endswith("/register"):
+            self.register_calls.append(parsed)
+            item = (
+                self._register.pop(0)
+                if self._register
+                else HttpResponse(status=200, body=json.dumps({"capability": self._capability}))
+            )
+        else:
+            self.push_calls.append(parsed)
+            item = self._push.pop(0) if self._push else HttpResponse(status=200, body="")
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _wire_sender(store, http):
+    """A real GatewaySender over the store, with no real sleeping/threads."""
+    return GatewaySender(
+        store=store,
+        gateway_url="https://gw.example/push",
+        http_client=http,
+        max_attempts=1,
+        backoff_base_s=0.0,
+        sleep=lambda _s: None,
+    )
 
 
 @pytest.fixture
@@ -113,13 +159,15 @@ def test_unregister_unknown_token_reports_not_removed(client):
 
 
 class _SpySender:
-    """Records payloads handed to send() without touching the network."""
+    """Records the payload handed to deliver_now() without touching the network."""
 
-    def __init__(self):
-        self.sent = []
+    def __init__(self, results=None):
+        self.delivered = []
+        self._results = results if results is not None else []
 
-    def send(self, payload):
-        self.sent.append(payload)
+    def deliver_now(self, payload):
+        self.delivered.append(payload)
+        return self._results
 
 
 def test_test_route_404_when_pipeline_not_wired(client):
@@ -143,11 +191,11 @@ def test_test_route_sends_generic_payload_to_registered_devices(client):
     assert body["ok"] is True
     assert body["devices"] == 2
 
-    # One generic payload handed to the sender (fan-out to devices happens inside
+    # One generic payload delivered synchronously (fan-out happens inside
     # GatewaySender). It honors the no-content privacy rule: only type/title/body
     # + a synthetic session id — no real content.
-    assert len(spy.sent) == 1
-    payload = spy.sent[0]
+    assert len(spy.delivered) == 1
+    payload = spy.delivered[0]
     assert payload["type"] == "complete"
     assert payload["session_id"].startswith("test-")
     assert payload["thread_id"] == payload["session_id"]
@@ -162,6 +210,67 @@ def test_test_route_works_with_no_devices(client):
     api.set_sender(spy)
     resp = c.post("/test", json={})
     assert resp.status_code == 200
-    assert resp.json()["devices"] == 0
-    # Still dispatched to the sender (which no-ops over an empty device list).
-    assert len(spy.sent) == 1
+    body = resp.json()
+    assert body["devices"] == 0
+    assert body["results"] == []
+    # With zero devices we short-circuit — no delivery attempted at all.
+    assert spy.delivered == []
+
+
+# -- Synchronous per-device result reporting (the diagnostic fix) ------------
+
+
+def test_test_route_reports_delivered_on_gateway_2xx(client):
+    c, store = client
+    http = _FakeHttp(push=[HttpResponse(status=200, body='{"ok":true}')])
+    api.set_sender(_wire_sender(store, http))
+    c.post(
+        "/register",
+        json={"device_token": "tok-abcd23346", "apns_env": "sandbox", "app_version": "1"},
+    )
+
+    body = c.post("/test", json={}).json()
+    assert body["devices"] == 1
+    assert len(body["results"]) == 1
+    result = body["results"][0]
+    assert result["delivered"] is True
+    assert result["status"] == 200
+    assert result["error"] is None
+    assert result["pruned"] is False
+    # Device token is MASKED to the last 6 chars — never the full token.
+    assert result["device"] == "…d23346"
+    assert "tok-abcd23346" not in json.dumps(body)
+
+
+def test_test_route_reports_status_on_gateway_4xx(client):
+    c, store = client
+    http = _FakeHttp(push=[HttpResponse(status=400, body="bad request")])
+    api.set_sender(_wire_sender(store, http))
+    c.post(
+        "/register",
+        json={"device_token": "tok-1", "apns_env": "sandbox", "app_version": "1"},
+    )
+
+    body = c.post("/test", json={}).json()
+    result = body["results"][0]
+    assert result["delivered"] is False
+    assert result["status"] == 400
+    assert result["error"] == "gateway_status_400"
+
+
+def test_test_route_reports_no_capability_when_register_fails(client):
+    c, store = client
+    # Register (capability fetch) returns a non-2xx → no capability obtainable.
+    http = _FakeHttp(register=[HttpResponse(status=500, body="boom")])
+    api.set_sender(_wire_sender(store, http))
+    c.post(
+        "/register",
+        json={"device_token": "tok-1", "apns_env": "sandbox", "app_version": "1"},
+    )
+
+    body = c.post("/test", json={}).json()
+    result = body["results"][0]
+    assert result["delivered"] is False
+    assert result["error"] == "no_capability"
+    # No push was attempted (capability could not be obtained).
+    assert http.push_calls == []

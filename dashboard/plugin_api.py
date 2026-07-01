@@ -33,7 +33,7 @@ import sys
 import types
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -158,10 +158,34 @@ class UnregisterResponse(BaseModel):
     removed: bool
 
 
+class TestPushDeviceResult(BaseModel):
+    """Privacy-safe per-device outcome of a synchronous test delivery.
+
+    ``device`` is the device token masked to its last 6 chars — never the full
+    token, never any payload content.
+    """
+
+    delivered: bool
+    status: Optional[int] = None
+    error: Optional[str] = None
+    pruned: bool = False
+    device: str
+
+
 class TestPushResponse(BaseModel):
     ok: bool = True
     # How many registered devices the sample push was fanned out to.
     devices: int
+    # Actual per-device delivery results (synchronous). Empty when devices == 0.
+    results: List[TestPushDeviceResult] = Field(default_factory=list)
+
+
+# ``from __future__ import annotations`` makes the field annotations strings, and
+# this module is loaded STANDALONE by file path (``spec_from_file_location``), so
+# pydantic can't lazily resolve ``List[TestPushDeviceResult]`` against a normal
+# package namespace. Rebuild the model now (globals are fully populated here) so
+# ``/test`` never trips ``PydanticUserError: not fully defined`` at request time.
+TestPushResponse.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -199,21 +223,28 @@ def unregister(req: UnregisterRequest) -> UnregisterResponse:
 
 @router.post("/test", response_model=TestPushResponse)
 def send_test(req: Optional[dict] = None) -> TestPushResponse:
-    """Deliver a sample push to this caller's registered device(s).
+    """Deliver a sample push SYNCHRONOUSLY and return the real per-device result.
 
-    Backs the iOS Settings "Send test notification" button: looks up the
-    registered devices and fans a generic ``complete``-type sample payload out
-    through a :class:`GatewaySender` over the shared on-disk store (gateway
-    capability, off-thread POST, 410→prune). It intentionally **bypasses the
-    suppression policy** — a test push is an explicit user action that should
-    always go out.
+    Backs the iOS Settings "Send test notification" button AND a plain ``curl``
+    diagnostic: looks up the registered devices and fans a generic
+    ``complete``-type sample payload out through a :class:`GatewaySender` over the
+    shared on-disk store (gateway capability, 410→prune). Unlike the hook hot
+    path (fire-and-forget), the test route delivers INLINE via
+    :meth:`GatewaySender.deliver_now` and returns exactly what happened per
+    device, so a false "sent" positive can't hide a real failure.
+
+    It intentionally **bypasses the suppression policy** — a test push is an
+    explicit user action that should always go out.
 
     Honors the no-content privacy rule: the payload carries only a generic
-    title/body + a synthetic ``session_id`` (see :func:`make_payload`).
+    title/body + a synthetic ``session_id`` (see :func:`make_payload`); results
+    carry only a MASKED device token, never content.
     """
     store = get_store()
     sender = get_sender()
     devices = len(store.list_all())
+    if devices == 0:
+        return TestPushResponse(devices=0, results=[])
     payload = make_payload("complete", f"test-{uuid.uuid4().hex[:8]}")
-    sender.send(payload)
-    return TestPushResponse(devices=devices)
+    results = sender.deliver_now(payload)
+    return TestPushResponse(devices=devices, results=results)

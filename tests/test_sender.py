@@ -448,6 +448,105 @@ def test_success_does_not_prune(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# deliver_now(): synchronous, returns structured per-device results
+# ---------------------------------------------------------------------------
+
+
+def test_deliver_now_returns_delivered_result_on_2xx(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dt-abcd23346", apns_env="production", app_version="1")
+    store.set_capability("dt-abcd23346", "cap")
+    http = FakeHttp(push_responses=[HttpResponse(status=200, body='{"ok":true}')])
+    sender = _make_sender(store, http)
+
+    results = sender.deliver_now(GENERIC_PAYLOAD)
+
+    assert results == [
+        {
+            "delivered": True,
+            "status": 200,
+            "error": None,
+            "pruned": False,
+            "device": "…d23346",  # masked to last 6 chars, never the full token
+        }
+    ]
+
+
+def test_deliver_now_reports_gateway_4xx(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dt-1", apns_env="production", app_version="1")
+    store.set_capability("dt-1", "cap")
+    http = FakeHttp(push_responses=[HttpResponse(status=400, body="bad")])
+    sender = _make_sender(store, http, max_attempts=1)
+
+    results = sender.deliver_now(GENERIC_PAYLOAD)
+
+    assert len(results) == 1
+    assert results[0]["delivered"] is False
+    assert results[0]["status"] == 400
+    assert results[0]["error"] == "gateway_status_400"
+
+
+def test_deliver_now_reports_no_capability(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dt-1", apns_env="production", app_version="1")
+    http = FakeHttp(register_responses=[HttpResponse(status=500, body="boom")])
+    sender = _make_sender(store, http)
+
+    results = sender.deliver_now(GENERIC_PAYLOAD)
+
+    assert results[0]["delivered"] is False
+    assert results[0]["error"] == "no_capability"
+    assert http.push_calls == []
+
+
+def test_deliver_now_reports_prune_on_410(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dead", apns_env="production", app_version="1")
+    store.set_capability("dead", "cap")
+    http = FakeHttp(push_responses=[HttpResponse(status=410, body="")])
+    sender = _make_sender(store, http)
+
+    results = sender.deliver_now(GENERIC_PAYLOAD)
+
+    assert results[0]["pruned"] is True
+    assert results[0]["error"] == "pruned_410"
+    assert store.get("dead") is None
+
+
+def test_deliver_now_reports_network_error(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dt-1", apns_env="production", app_version="1")
+    store.set_capability("dt-1", "cap")
+    http = FakeHttp(push_responses=[ConnectionError("down")])
+    sender = _make_sender(store, http, max_attempts=1)
+
+    results = sender.deliver_now(GENERIC_PAYLOAD)
+
+    assert results[0]["delivered"] is False
+    assert results[0]["error"].startswith("network:")
+
+
+def test_deliver_now_empty_store_returns_empty_list(tmp_path):
+    store = _store(tmp_path)  # empty
+    http = FakeHttp()
+    sender = _make_sender(store, http)
+
+    assert sender.deliver_now(GENERIC_PAYLOAD) == []
+
+
+def test_send_blocking_returns_results(tmp_path):
+    store = _store(tmp_path)
+    store.upsert(device_token="dt-1", apns_env="production", app_version="1")
+    store.set_capability("dt-1", "cap")
+    http = FakeHttp(push_responses=[HttpResponse(status=200, body="")])
+    sender = _make_sender(store, http)
+
+    results = sender.send_blocking(GENERIC_PAYLOAD)
+    assert len(results) == 1 and results[0]["delivered"] is True
+
+
+# ---------------------------------------------------------------------------
 # Off-thread: send() must not block
 # ---------------------------------------------------------------------------
 

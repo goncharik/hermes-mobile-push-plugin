@@ -144,6 +144,34 @@ def _is_prune(resp: HttpResponse) -> bool:
     return resp.status == 410
 
 
+def _mask_device(device_token: str) -> str:
+    """Mask a device token to its last 6 chars for privacy-safe diagnostics.
+
+    Never expose the full token (nor any payload content) in results/logs. A
+    short token is masked whole; a longer one becomes ``"…<last6>"``.
+    """
+    tail = device_token[-6:] if device_token else ""
+    return f"…{tail}"
+
+
+def _result(
+    *,
+    device_token: str,
+    delivered: bool = False,
+    status: Optional[int] = None,
+    error: Optional[str] = None,
+    pruned: bool = False,
+) -> Dict[str, Any]:
+    """Build the structured per-device delivery result (privacy-safe)."""
+    return {
+        "delivered": delivered,
+        "status": status,
+        "error": error,
+        "pruned": pruned,
+        "device": _mask_device(device_token),
+    }
+
+
 # ---------------------------------------------------------------------------
 # The sender
 # ---------------------------------------------------------------------------
@@ -202,9 +230,24 @@ class GatewaySender:
         except Exception as exc:  # pragma: no cover — pool shutdown / saturated
             logger.warning("hermes-push: could not schedule push delivery: %s", exc)
 
-    def send_blocking(self, payload: Dict[str, Any]) -> None:
-        """Run the fan-out synchronously (used by tests; not on the hot path)."""
-        self._deliver_all(dict(payload))
+    def send_blocking(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Run the fan-out synchronously (used by tests; not on the hot path).
+
+        Returns the structured per-device results (one dict per device).
+        """
+        return self._deliver_all(dict(payload))
+
+    def deliver_now(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Run the fan-out synchronously INLINE and return per-device results.
+
+        Used by the diagnostic ``/test`` route so a plain ``curl`` sees exactly
+        what happened per device (delivered / status / error / pruned). Unlike
+        :meth:`send`, this does NOT use the background executor — it runs on the
+        caller's thread. It is bounded by the per-request timeout + the bounded
+        retry budget, so it can't hang indefinitely. Do NOT call this on the hook
+        hot path (use :meth:`send`, which stays fire-and-forget).
+        """
+        return self._deliver_all(dict(payload))
 
     def shutdown(self, *, wait: bool = False) -> None:
         """Stop the background executor (best-effort; called on plugin teardown)."""
@@ -215,18 +258,32 @@ class GatewaySender:
 
     # -- delivery ---------------------------------------------------------
 
-    def _deliver_all(self, payload: Dict[str, Any]) -> None:
-        """Fan ``payload`` out to every registered device. Runs off-thread."""
+    def _deliver_all(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fan ``payload`` out to every registered device.
+
+        Returns a list of structured per-device results (one per device). Runs
+        on the caller's thread (the background executor calls it via
+        :meth:`send`; :meth:`deliver_now` / :meth:`send_blocking` call it inline).
+        """
         try:
             devices = self._store.list_all()
         except Exception as exc:  # pragma: no cover — store read failure
             logger.warning("hermes-push: could not list devices for push: %s", exc)
-            return
+            return []
+        results: List[Dict[str, Any]] = []
         for record in devices:
+            device_token = str(record.get("device_token") or "")
             try:
-                self._deliver_one(payload, record)
+                results.append(self._deliver_one(payload, record))
             except Exception as exc:  # never let one device sink the others
                 logger.warning("hermes-push: push delivery error: %s", exc)
+                results.append(
+                    _result(
+                        device_token=device_token,
+                        error=f"network: {type(exc).__name__}: {exc}",
+                    )
+                )
+        return results
 
     def _ensure_capability(self, record: Dict[str, Any]) -> Optional[str]:
         """Return the device's gateway-issued capability, fetching it if needed.
@@ -296,27 +353,33 @@ class GatewaySender:
             request["thread_id"] = thread_id
         return request
 
-    def _deliver_one(self, payload: Dict[str, Any], record: Dict[str, Any]) -> None:
+    def _deliver_one(
+        self, payload: Dict[str, Any], record: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """POST one device's request with timeout + bounded retries.
 
         Ensures a capability first (skipping the device when none is obtainable),
         then POSTs. A 403 (stale/rotated capability) triggers a single drop +
         re-fetch + retry; 410 prunes; 2xx is done; 5xx is retried (bounded); other
         4xx gives up.
+
+        Returns a structured, privacy-safe result dict (masked device token, no
+        payload content): ``{delivered, status, error, pruned, device}``.
         """
         device_token = str(record.get("device_token") or "")
         if not device_token:
-            return
+            return _result(device_token="", error="no_device_token")
 
         capability = self._ensure_capability(record)
         if not capability:
             logger.info("hermes-push: no capability for device; skipping this round")
-            return
+            return _result(device_token=device_token, error="no_capability")
 
         # `refreshed` bounds the 403 capability-refresh to a SINGLE re-fetch+retry
         # (never an unbounded loop), independent of the 5xx/transport retry budget.
         refreshed = False
         attempt = 1
+        last_error: Optional[str] = None
         while attempt <= self._max_attempts:
             request = self._build_request(payload, record, capability)
             body = json.dumps(request, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -324,13 +387,14 @@ class GatewaySender:
                 resp = self._http.post_json(self._gateway_url, body, timeout=self._timeout_s)
             except Exception as exc:
                 # Transport-level failure (timeout, connection refused, …).
+                last_error = f"network: {type(exc).__name__}: {exc}"
                 if attempt >= self._max_attempts:
                     logger.warning(
                         "hermes-push: push gave up after %d attempt(s): %s",
                         attempt,
                         exc,
                     )
-                    return
+                    return _result(device_token=device_token, error=last_error)
                 self._backoff(attempt)
                 attempt += 1
                 continue
@@ -341,10 +405,17 @@ class GatewaySender:
                     self._store.prune_invalid(device_token)
                 except Exception as exc:  # pragma: no cover
                     logger.warning("hermes-push: prune failed: %s", exc)
-                return
+                return _result(
+                    device_token=device_token,
+                    status=resp.status,
+                    error="pruned_410",
+                    pruned=True,
+                )
 
             if 200 <= resp.status < 300:
-                return
+                return _result(
+                    device_token=device_token, delivered=True, status=resp.status
+                )
 
             # 403: stale/rotated capability. Drop it, re-fetch once, retry once —
             # without consuming the bounded retry budget (so it works even at
@@ -354,7 +425,11 @@ class GatewaySender:
                     logger.warning(
                         "hermes-push: capability still rejected after refresh; giving up"
                     )
-                    return
+                    return _result(
+                        device_token=device_token,
+                        status=403,
+                        error="gateway_status_403",
+                    )
                 refreshed = True
                 logger.info("hermes-push: capability rejected (403); refreshing")
                 try:
@@ -365,7 +440,7 @@ class GatewaySender:
                 capability = self._ensure_capability(record)
                 if not capability:
                     logger.warning("hermes-push: could not refresh capability; giving up")
-                    return
+                    return _result(device_token=device_token, error="no_capability")
                 continue  # retry with the fresh capability (same attempt count)
 
             # Other non-2xx: retry transient (5xx) a few times; give up on 4xx.
@@ -373,9 +448,19 @@ class GatewaySender:
                 logger.warning(
                     "hermes-push: gateway returned %d; giving up", resp.status
                 )
-                return
+                return _result(
+                    device_token=device_token,
+                    status=resp.status,
+                    error=f"gateway_status_{resp.status}",
+                )
             self._backoff(attempt)
             attempt += 1
+
+        # Loop exhausted without a terminal result (all attempts were transient).
+        return _result(
+            device_token=device_token,
+            error=last_error or "delivery_failed",
+        )
 
     def _backoff(self, attempt: int) -> None:
         """Exponential backoff between retries (attempt is 1-based)."""
